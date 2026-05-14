@@ -252,6 +252,59 @@ app.get('/api/columns', requireAuth, requireDb, async (req, res) => {
     const outgoingFks = groupFks(outFks.rows, (r) => ({ refSchema: r.ref_schema, refTable: r.ref_table }));
     const incomingFks = groupFks(inFks.rows, (r) => ({ schema: r.schema, table: r.table }));
 
+    // Unique constraints AND unique indexes on this table. Composite-aware.
+    // Prisma's @@unique creates a unique index (not a table constraint), so we
+    // must look at pg_index too — UNION'd with pg_constraint for explicit ones.
+    const uniqRes = await getPool(req).query(`
+      SELECT name, columns FROM (
+        -- Explicit table constraints (PRIMARY KEY + UNIQUE)
+        SELECT c.conname AS name,
+               (
+                 SELECT json_agg(a.attname ORDER BY k.ord)
+                 FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+               ) AS columns
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE c.contype IN ('u','p')
+          AND n.nspname = $1 AND t.relname = $2
+        UNION ALL
+        -- Unique indexes (covers Prisma @@unique etc.)
+        SELECT ic.relname AS name,
+               (
+                 SELECT json_agg(a.attname ORDER BY k.ord)
+                 FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                 WHERE k.attnum <> 0  -- skip expression columns
+               ) AS columns
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_class t  ON t.oid  = i.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE i.indisunique
+          AND NOT i.indisprimary           -- already covered above
+          AND i.indpred IS NULL            -- skip partial indexes (can't easily dedupe)
+          AND NOT EXISTS (                 -- skip indexes backing a constraint (already covered)
+            SELECT 1 FROM pg_constraint c2
+            WHERE c2.conindid = i.indexrelid
+          )
+          AND n.nspname = $1 AND t.relname = $2
+      ) u
+      ORDER BY name
+    `, [schema, table]).catch(() => ({ rows: [] }));
+    // De-dupe by column set (just in case)
+    const seenCols = new Set();
+    const uniqueConstraints = [];
+    for (const r of uniqRes.rows) {
+      const cols = Array.isArray(r.columns) ? r.columns : [];
+      if (cols.length === 0) continue;
+      const key = cols.join('\0');
+      if (seenCols.has(key)) continue;
+      seenCols.add(key);
+      uniqueConstraints.push({ name: r.name, columns: cols });
+    }
+
     // Enum labels for any user-defined enum types referenced by columns.
     const enumPairs = [...new Set(
       cols.rows
@@ -285,6 +338,7 @@ app.get('/api/columns', requireAuth, requireDb, async (req, res) => {
       primaryKey: pk.rows.map(r => r.column_name),
       outgoingFks,
       incomingFks,
+      uniqueConstraints,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -311,6 +365,50 @@ app.get('/api/rows', requireAuth, requireDb, async (req, res) => {
       total: Number(countR.rows[0].c),
       limit, offset,
     });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---------- FK reference values ----------
+// Get distinct values from a referenced column. Used for FK validation in inserts.
+// GET /api/fk-values?schema=&table=&column=&limit=&search=
+app.get('/api/fk-values', requireAuth, requireDb, async (req, res) => {
+  const schema = String(req.query.schema || 'public');
+  const table = String(req.query.table || '');
+  const column = String(req.query.column || '');
+  const limit = Math.min(parseInt(req.query.limit, 10) || 500, 5000);
+  const search = req.query.search ? String(req.query.search) : '';
+  if (!table || !column) return res.status(400).json({ error: 'missing_fields' });
+  try {
+    const fq = `${qIdent(schema)}.${qIdent(table)}`;
+    const col = qIdent(column);
+    let sql, params;
+    if (search) {
+      sql = `SELECT DISTINCT ${col} AS v FROM ${fq} WHERE ${col}::text ILIKE $1 AND ${col} IS NOT NULL ORDER BY 1 LIMIT ${limit}`;
+      params = [`%${search}%`];
+    } else {
+      sql = `SELECT DISTINCT ${col} AS v FROM ${fq} WHERE ${col} IS NOT NULL ORDER BY 1 LIMIT ${limit}`;
+      params = [];
+    }
+    const r = await getPool(req).query(sql, params);
+    res.json({ values: r.rows.map(x => x.v) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---------- Existing unique-tuple values ----------
+// POST body: { schema, table, columns: [...], limit }
+// Returns up to `limit` existing tuples to avoid collisions during bulk insert.
+app.post('/api/unique-tuples', requireAuth, requireDb, async (req, res) => {
+  const { schema = 'public', table, columns } = req.body || {};
+  const limit = Math.min(parseInt(req.body?.limit, 10) || 10000, 100000);
+  if (!table || !Array.isArray(columns) || columns.length === 0) {
+    return res.status(400).json({ error: 'missing_fields' });
+  }
+  try {
+    const fq = `${qIdent(schema)}.${qIdent(table)}`;
+    const colsSql = columns.map(qIdent).join(', ');
+    const sql = `SELECT DISTINCT ${colsSql} FROM ${fq} LIMIT ${limit}`;
+    const r = await getPool(req).query(sql);
+    res.json({ rows: r.rows });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 

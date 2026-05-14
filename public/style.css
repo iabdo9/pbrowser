@@ -166,7 +166,7 @@ table.data td.actions button { padding: 2px 8px; font-size: 11px; margin-right: 
   display: block; font-size: 11px; color: var(--muted);
   text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px;
 }
-.modal .body input, .modal .body textarea { width: 100%; }
+.modal .body input, .modal .body textarea, .modal .body select { width: 100%; }
 .modal .body textarea { min-height: 64px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
 .modal footer {
   padding: 10px 14px; border-top: 1px solid var(--line);
@@ -261,8 +261,17 @@ a.fk-link:hover { background: var(--hover); }
   font-size: 10px; color: var(--muted); margin: 0; letter-spacing: 0;
 }
 .bulkgen-sel { width: 100%; }
-.bulkgen-opts { display: flex; flex-wrap: wrap; gap: 4px; }
+.bulkgen-opts { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .bulkgen-opts input { font-size: 12px; padding: 4px 6px; }
+.bulkgen-opts .opt-hint {
+  font-size: 11px; color: var(--muted);
+  padding: 2px 6px; border: 1px dashed var(--line);
+  background: #fafafa;
+}
+.bulkgen-opts .opt-hint.warn { color: var(--danger); border-color: var(--danger); }
+.bulkgen-uniq { margin-top: 10px; font-size: 12px; color: var(--muted); }
+.bulkgen-uniq-h { color: var(--fg); margin-bottom: 4px; }
+.bulkgen-uniq-item { padding-left: 8px; font-family: ui-monospace, Menlo, Consolas, monospace; }
 .bulkgen-preview {
   margin-top: 10px;
   background: #f7f7f7;

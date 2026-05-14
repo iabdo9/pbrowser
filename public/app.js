@@ -243,6 +243,7 @@ async function loadColumns() {
   state.primaryKey = r.primaryKey;
   state.outgoingFks = r.outgoingFks || [];
   state.incomingFks = r.incomingFks || [];
+  state.uniqueConstraints = r.uniqueConstraints || [];
   // Map: column_name -> { refSchema, refTable, refColumn } (only for single-column FKs)
   state.fkByColumn = {};
   for (const fk of state.outgoingFks) {
@@ -544,8 +545,55 @@ function openRowEditor({ mode, row }) {
 
     const curVal = row ? row[c.column_name] : null;
     const isLong = ['json', 'jsonb', 'text'].some(t => c.data_type.includes(t));
+    const fk = state.fkByColumn[c.column_name];
+    const isEnum = Array.isArray(c.enum_values) && c.enum_values.length > 0;
+    const isBool = c.data_type === 'boolean';
     let input;
-    if (isLong) {
+    let kind = 'input'; // 'input' | 'textarea' | 'select'
+
+    if (isEnum) {
+      kind = 'select';
+      input = el('select');
+      if (c.is_nullable === 'YES') input.appendChild(el('option', { value: '__pb_empty__' }, '(empty)'));
+      for (const v of c.enum_values) {
+        const o = el('option', { value: v }, v);
+        if (curVal != null && String(curVal) === String(v)) o.selected = true;
+        input.appendChild(o);
+      }
+    } else if (isBool) {
+      kind = 'select';
+      input = el('select');
+      for (const [val, lbl] of [['true', 'true'], ['false', 'false']]) {
+        const o = el('option', { value: val }, lbl);
+        if (curVal != null && String(curVal) === val) o.selected = true;
+        input.appendChild(o);
+      }
+    } else if (fk) {
+      kind = 'select';
+      input = el('select', { class: 'fk-select' });
+      input.appendChild(el('option', { value: '__pb_loading__' }, 'Loading values…'));
+      // Async load valid FK values
+      (async () => {
+        try {
+          const r = await api(`/api/fk-values?schema=${encodeURIComponent(fk.refSchema)}&table=${encodeURIComponent(fk.refTable)}&column=${encodeURIComponent(fk.refColumn)}&limit=1000`);
+          input.innerHTML = '';
+          input.appendChild(el('option', { value: '__pb_unset__' }, `— select ${fk.refTable}.${fk.refColumn} —`));
+          for (const v of r.values) {
+            const sv = v === null ? '' : String(v);
+            const o = el('option', { value: sv }, sv);
+            if (curVal != null && String(curVal) === sv) o.selected = true;
+            input.appendChild(o);
+          }
+          if (r.values.length === 1000) {
+            input.appendChild(el('option', { value: '__pb_unset__', disabled: true }, `… (showing first 1000)`));
+          }
+        } catch (e) {
+          input.innerHTML = '';
+          input.appendChild(el('option', { value: '__pb_unset__' }, `(failed to load: ${e.message})`));
+        }
+      })();
+    } else if (isLong) {
+      kind = 'textarea';
       input = el('textarea', { spellcheck: 'false' });
       input.value = curVal == null ? '' : (typeof curVal === 'object' ? JSON.stringify(curVal, null, 2) : String(curVal));
     } else {
@@ -577,7 +625,7 @@ function openRowEditor({ mode, row }) {
     }
     field.appendChild(cbRow);
     body.appendChild(field);
-    inputs[c.column_name] = { input, nullCb, useDefaultCb };
+    inputs[c.column_name] = { input, nullCb, useDefaultCb, kind, isEnum, isBool, fk };
   }
 
   modal({
@@ -591,10 +639,22 @@ function openRowEditor({ mode, row }) {
         onClick: async (close) => {
           const payload = {};
           for (const c of state.columns) {
-            const { input, nullCb, useDefaultCb } = inputs[c.column_name];
+            const { input, nullCb, useDefaultCb, kind, isEnum, isBool, fk } = inputs[c.column_name];
             if (useDefaultCb && useDefaultCb.checked) continue;
             if (nullCb.checked) { payload[c.column_name] = null; continue; }
             let v = input.value;
+            if (kind === 'select') {
+              if (v === '__pb_unset__' || v === '__pb_loading__') {
+                if (c.is_nullable === 'YES') { payload[c.column_name] = null; continue; }
+                throw new Error(`Please choose a value for ${c.column_name}`);
+              }
+              if (v === '__pb_empty__') { payload[c.column_name] = null; continue; }
+              if (isBool) { v = (v === 'true'); }
+              // enum / fk: keep as string; pg will coerce FK numeric types
+              if (fk && /^-?\d+(\.\d+)?$/.test(v)) v = Number(v);
+              payload[c.column_name] = v;
+              continue;
+            }
             // Try to coerce numerics / booleans / json for known types
             if (['json', 'jsonb'].some(t => c.data_type.includes(t))) {
               try { v = JSON.parse(v); } catch (_) { /* send as string; server will error if invalid */ }
@@ -709,8 +769,42 @@ function openBulkGenerator() {
   const plan = {};
   const cats = window.PBGen.listByCategory();
 
-  function buildOptsArea(container, def, current) {
+  // Cache of FK pools: "schema.table.column" -> Promise<values[]>
+  const fkPoolCache = {};
+  function loadFkPool(fk) {
+    const key = `${fk.refSchema}.${fk.refTable}.${fk.refColumn}`;
+    if (!fkPoolCache[key]) {
+      fkPoolCache[key] = api(`/api/fk-values?schema=${encodeURIComponent(fk.refSchema)}&table=${encodeURIComponent(fk.refTable)}&column=${encodeURIComponent(fk.refColumn)}&limit=5000`)
+        .then(r => r.values || [])
+        .catch(() => []);
+    }
+    return fkPoolCache[key];
+  }
+
+  function buildOptsArea(container, def, current, col) {
     container.innerHTML = '';
+    // Hint for the SKIP / default generator
+    if (def && def.id === 'default') {
+      const txt = col.column_default
+        ? `uses DB default: ${String(col.column_default).slice(0, 60)}`
+        : 'column omitted (uses DB default / NULL)';
+      container.appendChild(el('span', { class: 'opt-hint' }, txt));
+      return;
+    }
+    // Special hint for fk_pick
+    if (def && def.id === 'fk_pick') {
+      const fk = state.fkByColumn[col.column_name];
+      const hint = el('span', { class: 'opt-hint' }, fk ? `→ ${fk.refSchema}.${fk.refTable}.${fk.refColumn}: loading…` : 'No FK detected on this column');
+      container.appendChild(hint);
+      if (fk) {
+        loadFkPool(fk).then(values => {
+          plan[col.column_name].opts.pool = values;
+          hint.textContent = `→ ${fk.refSchema}.${fk.refTable}.${fk.refColumn}: ${values.length} valid value(s)`;
+          if (values.length === 0) hint.className = 'opt-hint warn';
+        });
+      }
+      return;
+    }
     if (!def || !def.opts || def.opts.length === 0) return;
     for (const o of def.opts) {
       const inp = el('input', {
@@ -719,19 +813,43 @@ function openBulkGenerator() {
         value: (current && current[o.key] != null) ? current[o.key] : (o.default || ''),
         style: 'width:140px;margin-right:4px',
         title: o.label,
-        oninput: () => { plan[def._col].opts[o.key] = inp.value; },
+        oninput: () => { plan[col.column_name].opts[o.key] = inp.value; },
       });
+      // seed plan with initial value
+      if (inp.value && plan[col.column_name].opts[o.key] == null) {
+        plan[col.column_name].opts[o.key] = inp.value;
+      }
       container.appendChild(inp);
     }
   }
 
+  const pkSet = new Set(state.primaryKey || []);
   for (const c of state.columns) {
-    const autoId = window.PBGen.autoDetect(c);
+    // Tag FK / PK columns so autoDetect can decide intelligently
+    const fk = state.fkByColumn[c.column_name];
+    const isPk = pkSet.has(c.column_name);
+    const colWithMeta = { ...c, __isFk: !!fk, __isPk: isPk };
+    const autoId = window.PBGen.autoDetect(colWithMeta);
     plan[c.column_name] = { id: autoId, opts: {} };
 
+    // Seed opts for special auto picks
+    if (autoId === 'enum' && Array.isArray(c.enum_values)) {
+      plan[c.column_name].opts.values = c.enum_values.join(',');
+    }
+    if (autoId === 'fk_pick' && fk) {
+      plan[c.column_name].opts.pool = [];
+      loadFkPool(fk).then(values => { plan[c.column_name].opts.pool = values; });
+    }
+
     grid.appendChild(el('div', { class: 'bulkgen-col' },
-      el('div', {}, c.column_name),
-      el('div', { class: 'col-type' }, c.data_type + (c.is_nullable === 'YES' ? ' · null' : '')),
+      el('div', {}, c.column_name + (isPk ? ' 🔑' : '') + (fk ? ' →' : '') + (Array.isArray(c.enum_values) ? ' ⊙' : '')),
+      el('div', { class: 'col-type' },
+        c.data_type
+        + (c.is_nullable === 'YES' ? ' · null' : '')
+        + (c.column_default ? ' · has default' : '')
+        + (Array.isArray(c.enum_values) ? ` · enum(${c.enum_values.length})` : '')
+        + (fk ? ` · fk ${fk.refTable}.${fk.refColumn}` : '')
+      ),
     ));
 
     const sel = el('select', { class: 'bulkgen-sel' });
@@ -749,20 +867,39 @@ function openBulkGenerator() {
     const optsWrap = el('div', { class: 'bulkgen-opts' });
     grid.appendChild(optsWrap);
 
-    // attach helpers
+    // initial opts area
     const def = window.PBGen.getById(autoId);
-    if (def) { def._col = c.column_name; buildOptsArea(optsWrap, def, {}); }
+    buildOptsArea(optsWrap, def, plan[c.column_name].opts, c);
 
     sel.addEventListener('change', () => {
-      plan[c.column_name] = { id: sel.value, opts: {} };
-      const nd = window.PBGen.getById(sel.value);
-      if (nd) { nd._col = c.column_name; }
-      // set defaults from generator
+      const newId = sel.value;
+      const nd = window.PBGen.getById(newId);
+      plan[c.column_name] = { id: newId, opts: {} };
+      // seed defaults from generator definition
       if (nd && nd.opts) for (const o of nd.opts) if (o.default != null) plan[c.column_name].opts[o.key] = o.default;
-      buildOptsArea(optsWrap, nd, plan[c.column_name].opts);
+      // re-seed for fk_pick / enum if user re-selects them on a tagged column
+      if (newId === 'enum' && Array.isArray(c.enum_values)) {
+        plan[c.column_name].opts.values = c.enum_values.join(',');
+      }
+      if (newId === 'fk_pick' && fk) {
+        plan[c.column_name].opts.pool = [];
+        loadFkPool(fk).then(values => { plan[c.column_name].opts.pool = values; });
+      }
+      buildOptsArea(optsWrap, nd, plan[c.column_name].opts, c);
     });
   }
   body.appendChild(grid);
+
+  // Unique constraint summary
+  const uqs = (state.uniqueConstraints || []).filter(u => Array.isArray(u.columns) && u.columns.length > 0);
+  if (uqs.length > 0) {
+    const ul = el('div', { class: 'bulkgen-uniq' });
+    ul.appendChild(el('div', { class: 'bulkgen-uniq-h' }, 'Unique constraints (rows colliding on these will be skipped):'));
+    for (const u of uqs) {
+      ul.appendChild(el('div', { class: 'bulkgen-uniq-item' }, `· (${u.columns.join(', ')})`));
+    }
+    body.appendChild(ul);
+  }
 
   const notice = el('div', { class: 'notice' });
   body.appendChild(notice);
@@ -795,16 +932,97 @@ function openBulkGenerator() {
           if (n > 1000 && !confirm(`Insert ${n} rows? This may take a moment.`)) return;
           notice.className = 'notice'; notice.textContent = `Generating ${n} rows…`;
           try {
-            const rows = await window.PBGen.generateRows({ columns: state.columns, count: n, plan });
-            notice.textContent = `Inserting ${rows.length} rows…`;
+            // Which unique constraints can we enforce client-side? Skip any constraint
+            // whose columns are produced by 'default' (Postgres assigns them).
+            const uniques = (state.uniqueConstraints || []).filter(u => {
+              if (!Array.isArray(u.columns) || u.columns.length === 0) return false;
+              return u.columns.every(c => {
+                const p = plan[c];
+                return p && p.id !== 'default';
+              });
+            });
+
+            // Pre-fetch existing tuples for each unique constraint
+            const existingSets = [];
+            for (const u of uniques) {
+              try {
+                const r = await api('/api/unique-tuples', {
+                  method: 'POST',
+                  body: { schema: state.schema, table: state.table, columns: u.columns, limit: 50000 },
+                });
+                const set = new Set();
+                for (const row of (r.rows || [])) {
+                  set.add(JSON.stringify(u.columns.map(c => row[c] ?? null)));
+                }
+                existingSets.push({ u, set });
+              } catch (_) { existingSets.push({ u, set: new Set() }); }
+            }
+
+            // Retry loop: keep generating until we have n unique rows, or until
+            // we make no progress for several attempts (combinatorially exhausted).
+            const seenBatchSets = existingSets.map(() => new Set());
+            const kept = [];
+            let droppedDup = 0, droppedExisting = 0;
+            let stalledRounds = 0;
+            const MAX_STALLED = 8;        // give up after this many fruitless waves
+            const MAX_TOTAL_GENERATED = Math.max(n * 50, 20000); // safety ceiling
+            let totalGenerated = 0;
+
+            while (kept.length < n && stalledRounds < MAX_STALLED && totalGenerated < MAX_TOTAL_GENERATED) {
+              const need = n - kept.length;
+              // Over-generate to amortize collision rate; grow on each stall.
+              const wave = Math.min(MAX_TOTAL_GENERATED - totalGenerated, Math.max(need * (2 + stalledRounds), 32));
+              const before = kept.length;
+              const batch = await window.PBGen.generateRows({ columns: state.columns, count: wave, plan });
+              totalGenerated += batch.length;
+
+              for (const row of batch) {
+                if (kept.length >= n) break;
+                let ok = true;
+                for (let i = 0; i < existingSets.length; i++) {
+                  const { u, set } = existingSets[i];
+                  const key = JSON.stringify(u.columns.map(c => row[c] ?? null));
+                  if (set.has(key)) { ok = false; droppedExisting++; break; }
+                  if (seenBatchSets[i].has(key)) { ok = false; droppedDup++; break; }
+                }
+                if (ok) {
+                  for (let i = 0; i < existingSets.length; i++) {
+                    const { u } = existingSets[i];
+                    seenBatchSets[i].add(JSON.stringify(u.columns.map(c => row[c] ?? null)));
+                  }
+                  kept.push(row);
+                }
+              }
+              stalledRounds = (kept.length === before) ? stalledRounds + 1 : 0;
+              if (kept.length < n) {
+                notice.textContent = `Generating… ${kept.length}/${n} unique (${droppedDup + droppedExisting} collisions skipped)`;
+              }
+            }
+
+            const rows = kept;
+            if (rows.length === 0) {
+              notice.className = 'notice error';
+              notice.textContent = `Could not generate any unique rows. Try widening generator ranges or adding more reference data.`;
+              return;
+            }
+            if (rows.length < n) {
+              notice.className = 'notice error';
+              notice.textContent = `Only ${rows.length}/${n} unique rows possible without violating unique constraints (combinations exhausted). Insert anyway? Click again to confirm.`;
+              // Two-click confirmation: change handler state via dataset
+              const btn = document.querySelector('.modal-backdrop:last-of-type footer .primary');
+              if (btn && btn.dataset.confirm !== '1') { btn.dataset.confirm = '1'; return; }
+            }
+            const dropMsg = (droppedDup + droppedExisting) > 0
+              ? ` (${droppedDup + droppedExisting} collisions skipped)` : '';
+            notice.className = 'notice';
+            notice.textContent = `Inserting ${rows.length} rows${dropMsg}…`;
             const r = await api('/api/insert-bulk', {
               method: 'POST',
               body: { schema: state.schema, table: state.table, rows },
             });
             close();
             await loadRows(); renderMain();
-            // Lightweight toast via alert (kept minimal)
-            console.log(`Inserted ${r.inserted} rows`);
+            console.log(`Inserted ${r.inserted} rows${dropMsg}`);
           } catch (e) {
             notice.className = 'notice error';
             notice.textContent = e.message;

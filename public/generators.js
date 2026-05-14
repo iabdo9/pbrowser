@@ -68,8 +68,13 @@
     { id: 'default', category: 'Special', label: 'Use column default / SKIP', gen: () => undefined },
     { id: 'constant', category: 'Special', label: 'Constant value', opts: [{ key: 'value', label: 'Value', default: '' }], gen: ({ opts }) => opts.value ?? '' },
     { id: 'sequence', category: 'Special', label: 'Sequence (i+start)', opts: [{ key: 'start', label: 'Start', default: '1' }, { key: 'step', label: 'Step', default: '1' }], gen: ({ i, opts }) => parseInt(opts.start || '1', 10) + i * parseInt(opts.step || '1', 10) },
-    { id: 'enum', category: 'Special', label: 'Pick from list (comma-separated)', opts: [{ key: 'values', label: 'Values', placeholder: 'a,b,c' }], gen: ({ opts }) => { const v = parseList(opts.values); return v.length ? pick(v) : null; } },
-
+    { id: 'enum', category: 'Special', label: 'Pick from list (comma-separated)', opts: [{ key: 'values', label: 'Values', placeholder: 'a,b,c' }], gen: ({ opts }) => { const v = parseList(opts.values); return v.length ? pick(v) : null; } }, {
+      id: 'fk_pick', category: 'Special', label: 'Foreign key (pick valid value)', gen: ({ opts }) => {
+        const pool = Array.isArray(opts && opts.pool) ? opts.pool : [];
+        if (pool.length === 0) return undefined; // skip -> DEFAULT (or fail at insert if NOT NULL)
+        return pool[Math.floor(Math.random() * pool.length)];
+      }
+    },
     // ===== Identifiers =====
     { id: 'uuid_v4', category: 'Identifiers', label: 'UUID v4', gen: () => uuidv4() },
     { id: 'hex_token', category: 'Identifiers', label: 'Hex token', opts: [{ key: 'bytes', label: 'Bytes', default: '16' }], gen: ({ opts }) => hex(2 * Math.max(1, parseInt(opts.bytes || '16', 10))) },
@@ -194,6 +199,22 @@
     const name = (col.column_name || '').toLowerCase();
     const type = (col.data_type || '').toLowerCase();
     const has = (s) => name.includes(s);
+
+    const hasDbDefault = col.column_default != null && col.column_default !== '';
+
+    // Columns with a real DB-side default (serial/identity, nextval, gen_random_uuid,
+    // now(), CURRENT_TIMESTAMP, etc.) should skip and let Postgres fill them in.
+    if (hasDbDefault) return 'default';
+
+    // Primary key WITHOUT a DB default: the app layer is expected to supply a value
+    // (e.g. Prisma @default(uuid()) on a text column). Generate a UUID by default so
+    // the NOT NULL constraint is satisfied. User can change it.
+    if (col.__isPk) return 'uuid_v4';
+
+    // Strong overrides: enum types and FK columns are handled by the caller
+    // (it sets fk_pick / enum and supplies pool/values). We still hint here.
+    if (Array.isArray(col.enum_values) && col.enum_values.length > 0) return 'enum';
+    if (col.__isFk) return 'fk_pick';
 
     if (type === 'uuid') return 'uuid_v4';
     if (type === 'boolean') return 'bool';
