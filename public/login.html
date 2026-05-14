@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>pbrowser — sign in</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+  <div class="login-wrap">
+    <form class="login-card" id="loginForm" autocomplete="off">
+      <h1>pbrowser</h1>
+      <p class="subtitle">Postgres browser — sign in</p>
+      <label for="u">Username</label>
+      <input id="u" name="username" type="text" autocomplete="username" required />
+      <label for="p">Password</label>
+      <input id="p" name="password" type="password" autocomplete="current-password" required />
+      <div id="totpField" style="display:none">
+        <label for="t">TOTP code</label>
+        <input id="t" name="totp" type="text" inputmode="numeric" pattern="[0-9 ]*" maxlength="9"
+          autocomplete="one-time-code" />
+      </div>
+      <button class="primary" type="submit">Sign in</button>
+      <div class="error" id="err"></div>
+    </form>
+  </div>
+  <script>
+    (async () => {
+      try {
+        const me = await fetch('/api/me').then(r => r.json());
+        if (me.totpRequired) document.getElementById('totpField').style.display = 'block';
+        if (me.auth) location.href = '/app';
+      } catch (_) { }
+    })();
+    const form = document.getElementById('loginForm');
+    const err = document.getElementById('err');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      const body = {
+        username: document.getElementById('u').value,
+        password: document.getElementById('p').value,
+        totp: document.getElementById('t').value,
+      };
+      const r = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) { location.href = '/app'; return; }
+      err.textContent = j.error === 'invalid_totp' ? 'Invalid TOTP code'
+        : j.error === 'invalid_credentials' ? 'Invalid username or password'
+          : (j.error || 'Login failed');
+    });
+  </script>
+</body>
+
+</html>
