@@ -18,6 +18,8 @@ const state = {
   orderBy: null,
   orderDir: 'ASC',
   view: 'tables', // 'tables' | 'sql'
+  // Selection for bulk operations. Keyed by JSON.stringify(pkObject).
+  selection: new Set(),
 };
 
 // ---------------- DOM helpers ----------------
@@ -233,9 +235,23 @@ async function selectTable(name) {
   state.table = name;
   state.offset = 0; state.orderBy = null;
   state.filter = null;
+  state.selection = new Set();
   await loadColumns();
   await loadRows();
   renderSide(); renderMain();
+}
+
+// Build a stable selection key from a row's primary key columns.
+function rowSelKey(row) {
+  if (!state.primaryKey || state.primaryKey.length === 0) return null;
+  const pk = {};
+  for (const k of state.primaryKey) pk[k] = row[k];
+  return JSON.stringify(pk);
+}
+function rowSelPk(row) {
+  const pk = {};
+  for (const k of state.primaryKey) pk[k] = row[k];
+  return pk;
 }
 async function loadColumns() {
   const r = await api(`/api/columns?schema=${encodeURIComponent(state.schema)}&table=${encodeURIComponent(state.table)}`);
@@ -297,6 +313,23 @@ function renderTable(root) {
   }, '⚡ Generate rows'));
   toolbar.appendChild(el('button', { onclick: refresh }, 'Refresh'));
 
+  // Bulk-delete button: only meaningful when we have a PK and a selection
+  if (state.primaryKey.length > 0) {
+    const selCount = state.selection.size;
+    toolbar.appendChild(el('button', {
+      class: 'danger' + (selCount === 0 ? ' ghost' : ''),
+      disabled: selCount === 0,
+      title: 'Delete the selected rows',
+      onclick: () => bulkDeleteSelected(),
+    }, selCount > 0 ? `Delete ${selCount} selected` : 'Delete selected'));
+    if (selCount > 0) {
+      toolbar.appendChild(el('button', {
+        class: 'ghost',
+        onclick: () => { state.selection = new Set(); renderMain(); },
+      }, 'Clear selection'));
+    }
+  }
+
   // pagination
   const pageStart = state.total === 0 ? 0 : state.offset + 1;
   const pageEnd = Math.min(state.offset + state.rows.length, state.total);
@@ -328,6 +361,30 @@ function renderTable(root) {
   const tbl = el('table', { class: 'data' });
   const thead = el('thead');
   const hr = el('tr');
+
+  // Select-all checkbox (header). Only when this table has a PK.
+  const hasPk = state.primaryKey.length > 0;
+  if (hasPk) {
+    const pageKeys = state.rows.map(rowSelKey).filter(Boolean);
+    const allOnPageSelected = pageKeys.length > 0 && pageKeys.every(k => state.selection.has(k));
+    const someOnPage = pageKeys.some(k => state.selection.has(k));
+    const headCb = el('input', {
+      type: 'checkbox',
+      title: 'Select all rows on this page',
+      onclick: (e) => {
+        if (e.target.checked) {
+          for (const k of pageKeys) state.selection.add(k);
+        } else {
+          for (const k of pageKeys) state.selection.delete(k);
+        }
+        renderMain();
+      },
+    });
+    if (allOnPageSelected) headCb.checked = true;
+    if (!allOnPageSelected && someOnPage) headCb.indeterminate = true;
+    hr.appendChild(el('th', { class: 'sel-col' }, headCb));
+  }
+
   for (const c of state.columns) {
     const isOrder = state.orderBy === c.column_name;
     const arrow = isOrder ? (state.orderDir === 'ASC' ? ' ↑' : ' ↓') : '';
@@ -357,6 +414,23 @@ function renderTable(root) {
   const tbody = el('tbody');
   for (const row of state.rows) {
     const tr = el('tr');
+    // Selection checkbox
+    if (hasPk) {
+      const k = rowSelKey(row);
+      const selected = k && state.selection.has(k);
+      if (selected) tr.classList.add('selected');
+      const cb = el('input', {
+        type: 'checkbox',
+        onclick: (e) => {
+          if (!k) return;
+          if (e.target.checked) state.selection.add(k);
+          else state.selection.delete(k);
+          renderMain();
+        },
+      });
+      if (selected) cb.checked = true;
+      tr.appendChild(el('td', { class: 'sel-col' }, cb));
+    }
     for (const c of state.columns) {
       const v = row[c.column_name];
       const fk = state.fkByColumn[c.column_name];
@@ -410,6 +484,28 @@ async function deleteRow(row) {
     await api('/api/delete', { method: 'POST', body: { schema: state.schema, table: state.table, pk } });
     await loadRows(); renderMain();
   } catch (e) { alert('Delete failed: ' + e.message); }
+}
+
+async function bulkDeleteSelected() {
+  if (state.primaryKey.length === 0) return;
+  if (state.selection.size === 0) return;
+  const pks = [];
+  for (const key of state.selection) {
+    try { pks.push(JSON.parse(key)); } catch (_) { }
+  }
+  if (pks.length === 0) return;
+  if (!confirm(`Delete ${pks.length} selected row${pks.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+  try {
+    const r = await api('/api/delete-bulk', {
+      method: 'POST',
+      body: { schema: state.schema, table: state.table, pks },
+    });
+    state.selection = new Set();
+    await loadRows(); renderMain();
+    console.log(`Deleted ${r.affected} rows`);
+  } catch (e) {
+    alert('Bulk delete failed: ' + e.message);
+  }
 }
 
 // ---------------- Related rows ----------------

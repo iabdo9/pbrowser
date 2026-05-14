@@ -546,6 +546,67 @@ app.post('/api/delete', requireAuth, requireDb, async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// Bulk delete. Body: { schema, table, pks: [{col:val,...}, ...] }
+// All PKs must share the same key set (validated). One transactional DELETE per batch.
+app.post('/api/delete-bulk', requireAuth, requireDb, async (req, res) => {
+  const { schema = 'public', table, pks } = req.body || {};
+  if (!table || !Array.isArray(pks) || pks.length === 0) {
+    return res.status(400).json({ error: 'missing_table_or_pks' });
+  }
+  if (pks.length > 100000) return res.status(400).json({ error: 'too_many_rows' });
+  const keys = Object.keys(pks[0] || {});
+  if (keys.length === 0) return res.status(400).json({ error: 'empty_pk' });
+  for (const p of pks) {
+    if (!p || typeof p !== 'object') return res.status(400).json({ error: 'invalid_pk' });
+    const k = Object.keys(p);
+    if (k.length !== keys.length || !keys.every(x => x in p)) {
+      return res.status(400).json({ error: 'inconsistent_pk_shape' });
+    }
+  }
+  const client = await getPool(req).connect();
+  try {
+    await client.query('BEGIN');
+    const fq = `${qIdent(schema)}.${qIdent(table)}`;
+    const BATCH = 500;
+    let affected = 0;
+    if (keys.length === 1) {
+      // Fast path: WHERE pk = ANY($1)
+      const col = qIdent(keys[0]);
+      for (let i = 0; i < pks.length; i += BATCH) {
+        const slice = pks.slice(i, i + BATCH).map(p => p[keys[0]]);
+        const r = await client.query(`DELETE FROM ${fq} WHERE ${col} = ANY($1)`, [slice]);
+        affected += r.rowCount;
+      }
+    } else {
+      // Composite PK: WHERE (a,b) IN (($1,$2), ($3,$4), ...)
+      const colsSql = '(' + keys.map(qIdent).join(', ') + ')';
+      for (let i = 0; i < pks.length; i += BATCH) {
+        const slice = pks.slice(i, i + BATCH);
+        const params = [];
+        let p = 1;
+        const tuples = slice.map(pk => {
+          const ph = keys.map(() => `$${p++}`).join(', ');
+          for (const k of keys) params.push(pk[k]);
+          return `(${ph})`;
+        });
+        const r = await client.query(
+          `DELETE FROM ${fq} WHERE ${colsSql} IN (${tuples.join(', ')})`,
+          params,
+        );
+        affected += r.rowCount;
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, affected });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) { }
+    res.status(400).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 // ---------- Raw SQL ----------
 app.post('/api/query', requireAuth, requireDb, async (req, res) => {
   const { sql, params } = req.body || {};

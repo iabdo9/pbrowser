@@ -142,8 +142,17 @@ table.data th {
   cursor: pointer; user-select: none;
 }
 table.data tr:hover td { background: #f7f7f7; }
+table.data tr.selected td { background: #fff4e5; }
+table.data tr.selected:hover td { background: #ffe9cc; }
+table.data th.sel-col, table.data td.sel-col {
+  width: 28px; padding: 4px 6px; text-align: center; cursor: default;
+}
+table.data th.sel-col { cursor: default; }
+table.data td.sel-col input { cursor: pointer; }
 table.data td.actions { white-space: nowrap; }
 table.data td.actions button { padding: 2px 8px; font-size: 11px; margin-right: 4px; }
+button.ghost { opacity: 0.55; }
+button.ghost:hover:not(:disabled) { opacity: 1; }
 .null { color: #aaa; font-style: italic; }
 
 /* ----- Modal ----- */
