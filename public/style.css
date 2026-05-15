@@ -292,3 +292,73 @@ a.fk-link:hover { background: var(--hover); }
   overflow: auto;
   white-space: pre-wrap;
 }
+
+/* -------- Map view (schema diagram) -------- */
+.map-wrap { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.map-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+.map-head h2 { margin: 0; flex: 0 0 auto; }
+.map-status { color: var(--muted); font-size: 12px; flex: 1; }
+.map-head button { padding: 4px 10px; font-size: 12px; }
+.map-canvas {
+  position: relative;
+  flex: 1; min-height: 0;
+  overflow: hidden;
+  background:
+    linear-gradient(#0000 0 0),
+    repeating-linear-gradient(0deg, #eee 0 1px, transparent 1px 24px),
+    repeating-linear-gradient(90deg, #eee 0 1px, transparent 1px 24px),
+    #fafafa;
+  cursor: grab;
+}
+.map-canvas:active { cursor: grabbing; }
+.map-world {
+  position: absolute; left: 0; top: 0;
+  transform-origin: 0 0;
+}
+.map-svg {
+  position: absolute; left: 0; top: 0;
+  transform-origin: 0 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.map-svg .map-edge {
+  fill: none; stroke: #333; stroke-width: 1.4;
+  pointer-events: stroke;
+}
+.map-svg .map-edge:hover { stroke: #b00020; stroke-width: 2; }
+.map-node {
+  position: absolute;
+  background: #fff;
+  border: 1px solid var(--line-strong);
+  box-shadow: 2px 2px 0 #0001;
+  font-size: 12px;
+  user-select: none;
+}
+.map-node-title {
+  background: var(--fg); color: #fff;
+  padding: 5px 8px;
+  font-weight: 600;
+  cursor: move;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.map-node-cols { background: #fff; }
+.map-col {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 8px;
+  border-top: 1px solid #f0f0f0;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+.map-col-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.map-col-type { color: var(--muted); font-size: 10px; }
+.map-col-tag {
+  background: #eee; color: #111; font-size: 9px;
+  padding: 1px 4px; border-radius: 2px; letter-spacing: 0.5px;
+}
+.map-more { color: var(--muted); font-style: italic; }
+

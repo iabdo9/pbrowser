@@ -343,6 +343,97 @@ app.get('/api/columns', requireAuth, requireDb, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ---------- Schema map: all tables + columns + FKs in a schema ----------
+app.get('/api/schema-map', requireAuth, requireDb, async (req, res) => {
+  const schema = String(req.query.schema || 'public');
+  try {
+    const pool = getPool(req);
+    const tablesRes = await pool.query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = $1 AND table_type IN ('BASE TABLE','VIEW')
+      ORDER BY table_name
+    `, [schema]);
+    const tableNames = tablesRes.rows.map(r => r.table_name);
+
+    const colsRes = await pool.query(`
+      SELECT table_name, column_name, data_type, ordinal_position
+      FROM information_schema.columns
+      WHERE table_schema = $1
+      ORDER BY table_name, ordinal_position
+    `, [schema]);
+
+    const pksRes = await pool.query(`
+      SELECT t.relname AS table_name, a.attname AS column_name
+      FROM pg_index i
+      JOIN pg_class t      ON t.oid = i.indrelid
+      JOIN pg_namespace n  ON n.oid = t.relnamespace
+      JOIN pg_attribute a  ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+      WHERE i.indisprimary AND n.nspname = $1
+    `, [schema]);
+
+    const fksRes = await pool.query(`
+      SELECT
+        tc.constraint_name,
+        tc.table_name        AS from_table,
+        kcu.column_name      AS from_column,
+        kcu.ordinal_position AS pos,
+        ccu.table_schema     AS to_schema,
+        ccu.table_name       AS to_table,
+        ccu.column_name      AS to_column
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema    = kcu.table_schema
+      JOIN information_schema.constraint_column_usage ccu
+        ON ccu.constraint_name = tc.constraint_name
+       AND ccu.table_schema    = tc.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_schema = $1
+      ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position
+    `, [schema]);
+
+    // Build tables list with columns + pks
+    const colsByTable = new Map();
+    for (const r of colsRes.rows) {
+      if (!colsByTable.has(r.table_name)) colsByTable.set(r.table_name, []);
+      colsByTable.get(r.table_name).push({ name: r.column_name, type: r.data_type });
+    }
+    const pksByTable = new Map();
+    for (const r of pksRes.rows) {
+      if (!pksByTable.has(r.table_name)) pksByTable.set(r.table_name, new Set());
+      pksByTable.get(r.table_name).add(r.column_name);
+    }
+    const tables = tableNames.map(name => ({
+      name,
+      columns: colsByTable.get(name) || [],
+      primaryKey: [...(pksByTable.get(name) || [])],
+    }));
+
+    // Group FK rows into composite-aware edges
+    const edgeMap = new Map();
+    for (const r of fksRes.rows) {
+      const key = `${r.from_table}::${r.constraint_name}`;
+      if (!edgeMap.has(key)) {
+        edgeMap.set(key, {
+          name: r.constraint_name,
+          fromTable: r.from_table,
+          fromColumns: [],
+          toSchema: r.to_schema,
+          toTable: r.to_table,
+          toColumns: [],
+        });
+      }
+      const e = edgeMap.get(key);
+      e.fromColumns.push(r.from_column);
+      e.toColumns.push(r.to_column);
+    }
+    const edges = [...edgeMap.values()];
+
+    res.json({ schema, tables, edges });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ---------- Rows: list / paginate ----------
 app.get('/api/rows', requireAuth, requireDb, async (req, res) => {
   const schema = String(req.query.schema || 'public');

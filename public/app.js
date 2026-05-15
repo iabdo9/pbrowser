@@ -17,7 +17,7 @@ const state = {
   offset: 0,
   orderBy: null,
   orderDir: 'ASC',
-  view: 'tables', // 'tables' | 'sql'
+  view: 'tables', // 'tables' | 'sql' | 'map'
   // Selection for bulk operations. Keyed by JSON.stringify(pkObject).
   selection: new Set(),
 };
@@ -130,6 +130,10 @@ function renderSide() {
     onclick: () => { state.view = 'tables'; renderMain(); renderSide(); },
   }, 'Tables'));
   navSec.appendChild(el('button', {
+    class: 'nav-btn' + (state.view === 'map' ? ' active' : ''),
+    onclick: () => { state.view = 'map'; renderMain(); renderSide(); },
+  }, 'Map'));
+  navSec.appendChild(el('button', {
     class: 'nav-btn' + (state.view === 'sql' ? ' active' : ''),
     onclick: () => { state.view = 'sql'; renderMain(); renderSide(); },
   }, 'SQL'));
@@ -174,6 +178,7 @@ function renderSide() {
 function renderMain() {
   const main = $('#main'); main.innerHTML = '';
   if (!state.connected) return renderConnect(main);
+  if (state.view === 'map') return renderMap(main);
   if (state.view === 'sql') return renderSql(main);
   if (!state.table) {
     main.appendChild(el('div', { class: 'empty' }, 'Select a table from the left.'));
@@ -777,6 +782,218 @@ function openRowEditor({ mode, row }) {
       },
     ],
   });
+}
+
+// ---------------- Map view (schema diagram) ----------------
+async function renderMap(root) {
+  const wrap = el('div', { class: 'map-wrap' });
+  const head = el('div', { class: 'map-head' });
+  head.appendChild(el('h2', { style: 'font-size:14px;text-transform:uppercase;letter-spacing:1px;margin:0' }, `Schema map · ${state.schema}`));
+  const status = el('span', { class: 'map-status' }, 'Loading…');
+  head.appendChild(status);
+  const relayout = el('button', { class: 'ghost' }, 'Relayout');
+  const zoomIn = el('button', { class: 'ghost' }, '+');
+  const zoomOut = el('button', { class: 'ghost' }, '−');
+  const zoomReset = el('button', { class: 'ghost' }, '100%');
+  head.appendChild(relayout); head.appendChild(zoomOut); head.appendChild(zoomReset); head.appendChild(zoomIn);
+  wrap.appendChild(head);
+  const canvas = el('div', { class: 'map-canvas' });
+  wrap.appendChild(canvas);
+  root.appendChild(wrap);
+
+  let data;
+  try {
+    data = await api(`/api/schema-map?schema=${encodeURIComponent(state.schema)}`);
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+    return;
+  }
+  if (!data.tables.length) { status.textContent = 'No tables in this schema.'; return; }
+  status.textContent = `${data.tables.length} tables · ${data.edges.length} relationships`;
+
+  // ---- layout ----
+  const tableByName = new Map(data.tables.map(t => [t.name, t]));
+  const positions = new Map(); // name -> {x,y,w,h}
+  function autoLayout() {
+    const n = data.tables.length;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(n * 1.6)));
+    const colW = 260, rowH = 0; // rowH dynamic per row
+    const gapX = 60, gapY = 50;
+    const rowHeights = [];
+    for (let i = 0; i < n; i++) {
+      const t = data.tables[i];
+      const h = 30 + Math.min(t.columns.length, 30) * 18 + (t.columns.length > 30 ? 18 : 0);
+      const r = Math.floor(i / cols);
+      rowHeights[r] = Math.max(rowHeights[r] || 0, h);
+    }
+    let y = 20;
+    for (let r = 0; r * cols < n; r++) {
+      for (let c = 0; c < cols && r * cols + c < n; c++) {
+        const t = data.tables[r * cols + c];
+        const h = 30 + Math.min(t.columns.length, 30) * 18 + (t.columns.length > 30 ? 18 : 0);
+        positions.set(t.name, { x: 20 + c * (colW + gapX), y, w: colW, h });
+      }
+      y += rowHeights[r] + gapY;
+    }
+  }
+  autoLayout();
+
+  // ---- SVG + nodes ----
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'map-svg');
+  // marker for arrowheads
+  const defs = document.createElementNS(SVG_NS, 'defs');
+  defs.innerHTML = `<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#333" /></marker>`;
+  svg.appendChild(defs);
+  const edgesGroup = document.createElementNS(SVG_NS, 'g');
+  svg.appendChild(edgesGroup);
+  canvas.appendChild(svg);
+
+  // Pan & zoom
+  let zoom = 1, panX = 0, panY = 0;
+  const world = el('div', { class: 'map-world' });
+  canvas.appendChild(world);
+  function applyTransform() {
+    world.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    svg.style.transform = world.style.transform;
+  }
+  applyTransform();
+  canvas.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    const delta = -Math.sign(e.deltaY) * 0.1;
+    const newZoom = Math.max(0.2, Math.min(2.5, zoom + delta));
+    zoom = newZoom; applyTransform();
+  }, { passive: false });
+  let panning = false, panStart = null;
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.target !== canvas && e.target !== svg) return;
+    panning = true; panStart = { x: e.clientX - panX, y: e.clientY - panY };
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!panning) return;
+    panX = e.clientX - panStart.x; panY = e.clientY - panStart.y; applyTransform();
+  });
+  window.addEventListener('mouseup', () => { panning = false; });
+  zoomIn.onclick = () => { zoom = Math.min(2.5, zoom + 0.1); applyTransform(); };
+  zoomOut.onclick = () => { zoom = Math.max(0.2, zoom - 0.1); applyTransform(); };
+  zoomReset.onclick = () => { zoom = 1; panX = 0; panY = 0; applyTransform(); };
+  relayout.onclick = () => { autoLayout(); renderNodes(); drawEdges(); };
+
+  // node DOM
+  const nodeEls = new Map();
+  function renderNodes() {
+    world.innerHTML = '';
+    nodeEls.clear();
+    for (const t of data.tables) {
+      const p = positions.get(t.name);
+      const node = el('div', { class: 'map-node', 'data-table': t.name });
+      node.style.left = p.x + 'px';
+      node.style.top = p.y + 'px';
+      node.style.width = p.w + 'px';
+      const title = el('div', { class: 'map-node-title' }, t.name);
+      title.title = 'Click to open · drag to move';
+      title.addEventListener('dblclick', () => {
+        state.view = 'tables';
+        selectTable(t.name);
+      });
+      node.appendChild(title);
+      const pkSet = new Set(t.primaryKey);
+      const fkColsForTable = new Set();
+      for (const ed of data.edges) if (ed.fromTable === t.name) for (const c of ed.fromColumns) fkColsForTable.add(c);
+      const colsContainer = el('div', { class: 'map-node-cols' });
+      const maxShow = 30;
+      const showCols = t.columns.slice(0, maxShow);
+      for (const c of showCols) {
+        const row = el('div', { class: 'map-col', 'data-col': c.name });
+        const tags = [];
+        if (pkSet.has(c.name)) tags.push('PK');
+        if (fkColsForTable.has(c.name)) tags.push('FK');
+        row.appendChild(el('span', { class: 'map-col-name' }, c.name));
+        row.appendChild(el('span', { class: 'map-col-type' }, c.type));
+        if (tags.length) row.appendChild(el('span', { class: 'map-col-tag' }, tags.join('·')));
+        colsContainer.appendChild(row);
+      }
+      if (t.columns.length > maxShow) {
+        colsContainer.appendChild(el('div', { class: 'map-col map-more' }, `+ ${t.columns.length - maxShow} more`));
+      }
+      node.appendChild(colsContainer);
+
+      // drag
+      let dragging = false, ds = null;
+      title.addEventListener('mousedown', (e) => {
+        e.stopPropagation();
+        dragging = true;
+        ds = { x: e.clientX, y: e.clientY, ox: p.x, oy: p.y };
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        p.x = ds.ox + (e.clientX - ds.x) / zoom;
+        p.y = ds.oy + (e.clientY - ds.y) / zoom;
+        node.style.left = p.x + 'px';
+        node.style.top = p.y + 'px';
+        drawEdges();
+      });
+      window.addEventListener('mouseup', () => { dragging = false; });
+
+      world.appendChild(node);
+      nodeEls.set(t.name, node);
+      // measure actual height for accurate edge anchoring
+      requestAnimationFrame(() => {
+        p.h = node.offsetHeight || p.h;
+        drawEdges();
+      });
+    }
+  }
+
+  function anchorFor(tableName, columnName) {
+    const p = positions.get(tableName);
+    if (!p) return null;
+    const node = nodeEls.get(tableName);
+    if (!node) return { x: p.x + p.w / 2, y: p.y + p.h / 2 };
+    const colEl = node.querySelector(`.map-col[data-col="${CSS.escape(columnName)}"]`);
+    if (!colEl) return { x: p.x + p.w / 2, y: p.y + p.h / 2, midY: p.y + p.h / 2 };
+    const rel = colEl.offsetTop + colEl.offsetHeight / 2;
+    return { left: p.x, right: p.x + p.w, y: p.y + rel, w: p.w };
+  }
+
+  function drawEdges() {
+    // Determine SVG size
+    let maxX = 0, maxY = 0;
+    for (const p of positions.values()) { maxX = Math.max(maxX, p.x + p.w); maxY = Math.max(maxY, p.y + p.h); }
+    svg.setAttribute('width', maxX + 60);
+    svg.setAttribute('height', maxY + 60);
+    edgesGroup.innerHTML = '';
+    for (const ed of data.edges) {
+      if (ed.toSchema && ed.toSchema !== state.schema) continue; // skip cross-schema for now
+      if (!tableByName.has(ed.toTable)) continue;
+      const a = anchorFor(ed.fromTable, ed.fromColumns[0]);
+      const b = anchorFor(ed.toTable, ed.toColumns[0]);
+      if (!a || !b) continue;
+      // pick sides: connect closer horizontal side
+      const ax = (a.left + a.right) / 2;
+      const bx = (b.left + b.right) / 2;
+      const aSide = ax < bx ? a.right : a.left;
+      const bSide = ax < bx ? b.left : b.right;
+      const ay = a.y, by = b.y;
+      const dx = Math.abs(bSide - aSide);
+      const curve = Math.min(120, Math.max(30, dx / 2));
+      const c1x = aSide + (ax < bx ? curve : -curve);
+      const c2x = bSide + (ax < bx ? -curve : curve);
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', `M ${aSide} ${ay} C ${c1x} ${ay}, ${c2x} ${by}, ${bSide} ${by}`);
+      path.setAttribute('class', 'map-edge');
+      path.setAttribute('marker-end', 'url(#arrow)');
+      const title = document.createElementNS(SVG_NS, 'title');
+      title.textContent = `${ed.fromTable}.${ed.fromColumns.join(',')} → ${ed.toTable}.${ed.toColumns.join(',')}`;
+      path.appendChild(title);
+      edgesGroup.appendChild(path);
+    }
+  }
+
+  renderNodes();
+  // edges drawn via rAF after nodes mount
 }
 
 // ---------------- SQL view ----------------
