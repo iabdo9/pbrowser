@@ -13,6 +13,7 @@ A minimalist, self-hosted PostgreSQL browser for the web. Login, paste a connect
 - 🔗 **Foreign-key navigation** — outgoing FKs render as clickable links; every row exposes a "Related" view that pulls in incoming references.
 - ⚡ **Bulk random row generator** — ~80 generators across 11 categories (names, addresses, dates, ids, lorem, etc.) with FK-valid picks, enum seeding, unique-constraint deduping, and exact-count retry.
 - ☑️ **Bulk delete with checkboxes** — select rows across pages, transactional batched delete, supports composite primary keys.
+- 🗺️ **Schema map** — interactive ER-style diagram of every table, column, PK/FK tag, and relationship; drag, zoom, pan, and double-click a table to jump straight to its rows.
 - 🧪 **Raw SQL editor** — Ctrl/Cmd+Enter to run, results rendered as a table.
 - 🖤 **Minimalist UI** — vanilla JS, vanilla CSS, no build step.
 
@@ -107,6 +108,17 @@ Click **⚡ Generate rows** on any table:
 
 The **SQL** view runs arbitrary statements against the active connection. Ctrl/Cmd+Enter to execute. Results are rendered as a table.
 
+### Schema map
+
+The **Map** view in the sidebar renders the entire current schema as an interactive diagram:
+
+- Each table is a node with a dark title bar and a row per column showing the type and **PK** / **FK** tags.
+- Foreign keys are drawn as bezier arrows from the child column to the referenced parent column (composite FKs included; hover an edge for a `from.col → to.col` tooltip).
+- Drag a node by its title bar to rearrange; **Relayout** snaps everything back to an auto-grid.
+- Pan by dragging the empty canvas, zoom with `Ctrl/Cmd + wheel` or the `+` / `−` / `100%` buttons.
+- Double-click a node title to jump to that table's rows in the Tables view.
+- Powered by a single `/api/schema-map` query — no build step, no diagramming library, just SVG + DOM.
+
 ## Architecture
 
 ```
@@ -139,6 +151,7 @@ Internal HTTP endpoints (session-authenticated, JSON):
 | POST   | `/api/disconnect`     | Close the pool                                       |
 | GET    | `/api/schemas`        | List schemas and tables                              |
 | GET    | `/api/columns`        | Columns, PK, FKs, unique constraints/indexes, enums  |
+| GET    | `/api/schema-map`     | All tables, columns, and FK edges in a schema        |
 | GET    | `/api/rows`           | Paginated rows with sort/filter                      |
 | GET    | `/api/related`        | Incoming references for a row                        |
 | GET    | `/api/fk-values`      | Foreign-key value picker                             |
