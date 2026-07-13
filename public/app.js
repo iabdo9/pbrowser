@@ -633,6 +633,25 @@ async function navigateToTable(schema, table, filter) {
   renderSide(); renderMain();
 }
 
+// ---------------- Array column helpers ----------------
+// Postgres array columns report data_type === 'ARRAY' with udt_name like '_text' / '_int4'.
+const NUMERIC_ARRAY_UDT = new Set(['_int2', '_int4', '_int8', '_float4', '_float8', '_numeric', '_oid']);
+
+// Turn the edit-field string into a JS array (node-postgres formats a JS array into a
+// valid array literal) or null. Accepts JSON (["a","b"] / [1,2]) or a Postgres literal
+// ({a,b}); a blank field becomes null when the column is nullable, else an empty array.
+function parseArrayInput(raw, numeric, nullable) {
+  let s = String(raw).trim();
+  if (s === '') return nullable ? null : [];
+  if (s[0] === '[') {
+    try { const a = JSON.parse(s); if (Array.isArray(a)) return a; } catch (_) { /* fall through */ }
+  }
+  if (s[0] === '{' && s[s.length - 1] === '}') s = s.slice(1, -1).trim();
+  if (s === '') return [];
+  const parts = s.split(',').map(x => x.trim().replace(/^"([\s\S]*)"$/, '$1'));
+  return numeric ? parts.map(Number) : parts;
+}
+
 // ---------------- Row editor ----------------
 function openRowEditor({ mode, row }) {
   const body = el('div');
@@ -649,6 +668,7 @@ function openRowEditor({ mode, row }) {
     const fk = state.fkByColumn[c.column_name];
     const isEnum = Array.isArray(c.enum_values) && c.enum_values.length > 0;
     const isBool = c.data_type === 'boolean';
+    const isArray = c.data_type === 'ARRAY';
     let input;
     let kind = 'input'; // 'input' | 'textarea' | 'select'
 
@@ -693,6 +713,11 @@ function openRowEditor({ mode, row }) {
           input.appendChild(el('option', { value: '__pb_unset__' }, `(failed to load: ${e.message})`));
         }
       })();
+    } else if (isArray) {
+      kind = 'textarea';
+      input = el('textarea', { spellcheck: 'false' });
+      // Render as JSON so empty arrays show as [] (not blank) and elements round-trip.
+      input.value = curVal == null ? '' : (Array.isArray(curVal) ? JSON.stringify(curVal) : String(curVal));
     } else if (isLong) {
       kind = 'textarea';
       input = el('textarea', { spellcheck: 'false' });
@@ -756,8 +781,10 @@ function openRowEditor({ mode, row }) {
               payload[c.column_name] = v;
               continue;
             }
-            // Try to coerce numerics / booleans / json for known types
-            if (['json', 'jsonb'].some(t => c.data_type.includes(t))) {
+            // Try to coerce numerics / booleans / json / arrays for known types
+            if (c.data_type === 'ARRAY') {
+              v = parseArrayInput(v, NUMERIC_ARRAY_UDT.has(c.udt_name), c.is_nullable === 'YES');
+            } else if (['json', 'jsonb'].some(t => c.data_type.includes(t))) {
               try { v = JSON.parse(v); } catch (_) { /* send as string; server will error if invalid */ }
             } else if (c.data_type === 'boolean') {
               if (v.toLowerCase() === 'true') v = true;
