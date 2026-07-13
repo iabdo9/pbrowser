@@ -17,10 +17,6 @@ A minimalist, self-hosted PostgreSQL browser for the web. Login, paste a connect
 - 🧪 **Raw SQL editor** — Ctrl/Cmd+Enter to run, results rendered as a table.
 - 🖤 **Minimalist UI** — vanilla JS, vanilla CSS, no build step.
 
-## Screenshots
-
-> _Add your screenshots to `docs/` and reference them here._
-
 ## Quick start
 
 ```bash
