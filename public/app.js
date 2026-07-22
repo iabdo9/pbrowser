@@ -44,6 +44,16 @@ function fmtCell(v) {
   if (typeof v === 'object') return document.createTextNode(JSON.stringify(v));
   return document.createTextNode(String(v));
 }
+// Inline monochrome line icons (Feather-style, inherit currentColor).
+const ICONS = {
+  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>',
+};
+function icon(name) {
+  const span = el('span', { class: 'icon' });
+  span.innerHTML = ICONS[name] || '';
+  return span;
+}
 
 // ---------------- API ----------------
 async function api(path, opts = {}) {
@@ -188,10 +198,85 @@ function renderMain() {
 }
 
 // ---------------- Connect view ----------------
+// Establish a pool (by saved id or raw connection string) and enter the app.
+async function doConnect(body) {
+  const j = await api('/api/connect', { method: 'POST', body });
+  state.connected = true; state.info = j.info;
+  await loadSchemas();
+  renderAll();
+}
+
+// Fill `container` with the list of previously-used connections (one-click reconnect).
+async function renderSavedConnections(container) {
+  container.innerHTML = '';
+  let conns = [];
+  try { conns = (await api('/api/connections')).connections || []; } catch (_) { return; }
+  if (conns.length === 0) return;
+
+  container.appendChild(el('label', {}, 'Recent connections'));
+  const listEl = el('div', { class: 'conn-list' });
+  for (const c of conns) {
+    const sub = `${c.user ? c.user + '@' : ''}${c.host || ''}${c.port ? ':' + c.port : ''}${c.db ? '/' + c.db : ''}`;
+    const card = el('div', { class: 'conn-card' });
+
+    const connectBtn = el('button', {
+      class: 'conn-open', title: 'Reconnect',
+      onclick: async () => {
+        connectBtn.disabled = true; connectBtn.classList.add('loading');
+        try {
+          await doConnect({ id: c.id });
+        } catch (e) {
+          connectBtn.disabled = false; connectBtn.classList.remove('loading');
+          alert('Connect failed: ' + e.message);
+        }
+      },
+    },
+      el('div', { class: 'conn-label' }, c.label || c.db || 'connection'),
+      el('div', { class: 'conn-sub' }, sub || '—'),
+    );
+
+    const editBtn = el('button', {
+      class: 'ghost sm', title: 'Rename',
+      onclick: async (e) => {
+        e.stopPropagation();
+        const name = prompt('Label for this connection:', c.label || '');
+        if (name == null) return;
+        try {
+          await api(`/api/connections/${encodeURIComponent(c.id)}`, { method: 'PATCH', body: { label: name } });
+          renderSavedConnections(container);
+        } catch (err) { alert('Rename failed: ' + err.message); }
+      },
+    }, icon('edit'));
+
+    const delBtn = el('button', {
+      class: 'ghost sm danger', title: 'Remove',
+      onclick: async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Remove saved connection "${c.label || sub}"?`)) return;
+        try {
+          await api(`/api/connections/${encodeURIComponent(c.id)}`, { method: 'DELETE' });
+          renderSavedConnections(container);
+        } catch (err) { alert('Remove failed: ' + err.message); }
+      },
+    }, icon('trash'));
+
+    card.appendChild(connectBtn);
+    card.appendChild(el('div', { class: 'conn-actions' }, editBtn, delBtn));
+    listEl.appendChild(card);
+  }
+  container.appendChild(listEl);
+}
+
 function renderConnect(root) {
   const wrap = el('div', { class: 'connect-wrap' });
   wrap.appendChild(el('h2', {}, 'Connect to PostgreSQL'));
-  wrap.appendChild(el('label', { for: 'cs' }, 'Connection string'));
+
+  // Previously-used connections (populated async).
+  const savedWrap = el('div', { class: 'saved-conns' });
+  wrap.appendChild(savedWrap);
+  renderSavedConnections(savedWrap);
+
+  wrap.appendChild(el('label', { for: 'cs' }, 'New connection string'));
   const input = el('input', {
     id: 'cs', type: 'text',
     placeholder: 'postgres://user:pass@host:5432/dbname',
@@ -200,7 +285,7 @@ function renderConnect(root) {
     spellcheck: 'false',
   });
   wrap.appendChild(input);
-  wrap.appendChild(el('p', { class: 'hint' }, 'Format: postgres://user:password@host:port/database. SSL options can be appended as query parameters.'));
+  wrap.appendChild(el('p', { class: 'hint' }, 'Format: postgres://user:password@host:port/database. SSL options can be appended as query parameters. Successful connections are saved here for one-click reconnect.'));
   const err = el('div', { class: 'error' });
   const btn = el('button', {
     class: 'primary',
@@ -208,10 +293,7 @@ function renderConnect(root) {
       err.textContent = '';
       btn.disabled = true; btn.textContent = 'Connecting…';
       try {
-        const j = await api('/api/connect', { method: 'POST', body: { connectionString: input.value } });
-        state.connected = true; state.info = j.info;
-        await loadSchemas();
-        renderAll();
+        await doConnect({ connectionString: input.value });
       } catch (e) {
         err.textContent = e.message;
       } finally {

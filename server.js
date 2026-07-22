@@ -2,6 +2,7 @@
 
 require('dotenv').config();
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
@@ -75,6 +76,72 @@ function requireDb(req, res, next) {
   next();
 }
 
+// ---------- Saved connections ----------
+// Persisted to disk so the user can one-click reconnect without re-entering
+// credentials. Holds DB passwords in plaintext (same posture as DEFAULT_PG_URL
+// in .env), so the file is written 0600 and must stay gitignored. The full
+// connection string is NEVER sent to the browser — only host/user/db metadata.
+const CONNECTIONS_FILE = process.env.CONNECTIONS_FILE || path.join(__dirname, 'connections.json');
+
+function loadConnections() {
+  try {
+    const arr = JSON.parse(fs.readFileSync(CONNECTIONS_FILE, 'utf8'));
+    return Array.isArray(arr) ? arr : [];
+  } catch (_) { return []; }
+}
+
+function saveConnections(list) {
+  try {
+    fs.writeFileSync(CONNECTIONS_FILE, JSON.stringify(list, null, 2), { mode: 0o600 });
+  } catch (e) { console.error('Failed to persist connections:', e.message); }
+}
+
+// Derive non-secret display fields from a connection string (URL form).
+function describeConn(cs) {
+  try {
+    const u = new URL(cs);
+    return {
+      host: u.hostname || '',
+      port: u.port || '',
+      db: decodeURIComponent((u.pathname || '').replace(/^\//, '')) || '',
+      user: decodeURIComponent(u.username || '') || '',
+    };
+  } catch (_) {
+    return { host: '', port: '', db: '', user: '' };
+  }
+}
+
+// Client-safe projection: everything except the connection string (secret).
+function publicConn(c) {
+  return {
+    id: c.id, label: c.label, host: c.host, port: c.port,
+    db: c.db, user: c.user, createdAt: c.createdAt, lastUsedAt: c.lastUsedAt,
+  };
+}
+
+// Remember a successfully-used connection string (dedupe by exact string).
+function rememberConnection(cs, label) {
+  const list = loadConnections();
+  const now = new Date().toISOString();
+  const desc = describeConn(cs);
+  const existing = list.find(c => c.connectionString === cs);
+  if (existing) {
+    Object.assign(existing, desc, { lastUsedAt: now });
+    if (label) existing.label = String(label).slice(0, 100);
+  } else {
+    list.push({
+      id: crypto.randomBytes(9).toString('hex'),
+      label: (label && String(label).slice(0, 100))
+        || (desc.user && desc.host ? `${desc.user}@${desc.host}${desc.db ? '/' + desc.db : ''}` : (desc.db || 'connection')),
+      connectionString: cs,
+      ...desc,
+      createdAt: now,
+      lastUsedAt: now,
+    });
+  }
+  saveConnections(list);
+}
+
 // ---------- Identifier quoting ----------
 function qIdent(name) {
   if (typeof name !== 'string' || name.length === 0) {
@@ -118,7 +185,13 @@ app.get('/api/me', (req, res) => {
 
 // ---------- Connection ----------
 app.post('/api/connect', requireAuth, async (req, res) => {
-  const { connectionString } = req.body || {};
+  let { connectionString, id, label } = req.body || {};
+  // Reconnect to a saved connection by id (the browser never holds the secret).
+  if (id) {
+    const saved = loadConnections().find(c => c.id === id);
+    if (!saved) return res.status(404).json({ error: 'unknown_connection' });
+    connectionString = saved.connectionString;
+  }
   if (!connectionString || typeof connectionString !== 'string') {
     return res.status(400).json({ error: 'missing_connection_string' });
   }
@@ -133,11 +206,38 @@ app.post('/api/connect', requireAuth, async (req, res) => {
     const r = await pool.query('SELECT current_database() AS db, current_user AS usr, version() AS version');
     const info = r.rows[0];
     pools.set(req.sessionID, { pool, info });
+    try { rememberConnection(connectionString, label); } catch (_) { /* non-fatal */ }
     res.json({ ok: true, info });
   } catch (e) {
     try { await pool.end(); } catch (_) { }
     res.status(400).json({ error: 'connect_failed', detail: e.message });
   }
+});
+
+// ---------- Saved connections CRUD (metadata only; secrets stay server-side) ----------
+app.get('/api/connections', requireAuth, (req, res) => {
+  const list = loadConnections()
+    .sort((a, b) => String(b.lastUsedAt || '').localeCompare(String(a.lastUsedAt || '')));
+  res.json({ connections: list.map(publicConn) });
+});
+
+app.patch('/api/connections/:id', requireAuth, (req, res) => {
+  const { label } = req.body || {};
+  const list = loadConnections();
+  const c = list.find(x => x.id === req.params.id);
+  if (!c) return res.status(404).json({ error: 'unknown_connection' });
+  if (typeof label === 'string' && label.trim()) c.label = label.trim().slice(0, 100);
+  saveConnections(list);
+  res.json({ ok: true, connection: publicConn(c) });
+});
+
+app.delete('/api/connections/:id', requireAuth, (req, res) => {
+  const list = loadConnections();
+  const idx = list.findIndex(x => x.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'unknown_connection' });
+  list.splice(idx, 1);
+  saveConnections(list);
+  res.json({ ok: true });
 });
 
 app.post('/api/disconnect', requireAuth, async (req, res) => {
