@@ -17,7 +17,13 @@ const state = {
   offset: 0,
   orderBy: null,
   orderDir: 'ASC',
-  view: 'tables', // 'tables' | 'sql' | 'map'
+  indexes: [],
+  constraints: [],
+  dbSchemas: [],
+  views: [],
+  functions: [],
+  roles: [],
+  view: 'tables', // 'tables' | 'structure' | 'database' | 'sql' | 'map'
   // Selection for bulk operations. Keyed by JSON.stringify(pkObject).
   selection: new Set(),
 };
@@ -140,6 +146,14 @@ function renderSide() {
     onclick: () => { state.view = 'tables'; renderMain(); renderSide(); },
   }, 'Tables'));
   navSec.appendChild(el('button', {
+    class: 'nav-btn' + (state.view === 'structure' ? ' active' : ''),
+    onclick: () => { state.view = 'structure'; renderMain(); renderSide(); },
+  }, 'Structure'));
+  navSec.appendChild(el('button', {
+    class: 'nav-btn' + (state.view === 'database' ? ' active' : ''),
+    onclick: () => { state.view = 'database'; renderMain(); renderSide(); },
+  }, 'Database'));
+  navSec.appendChild(el('button', {
     class: 'nav-btn' + (state.view === 'map' ? ' active' : ''),
     onclick: () => { state.view = 'map'; renderMain(); renderSide(); },
   }, 'Map'));
@@ -170,7 +184,10 @@ function renderSide() {
 
   // tables
   const tSec = el('div', { class: 'section' });
-  tSec.appendChild(el('h3', {}, `Tables (${state.tables.length})`));
+  tSec.appendChild(el('div', { class: 'sec-head' },
+    el('h3', {}, `Tables (${state.tables.length})`),
+    el('button', { class: 'ghost sm', title: 'New table', onclick: () => openCreateTable() }, '+'),
+  ));
   const list = el('div', { class: 'table-list' });
   for (const t of state.tables) {
     const it = el('div', {
@@ -188,6 +205,8 @@ function renderSide() {
 function renderMain() {
   const main = $('#main'); main.innerHTML = '';
   if (!state.connected) return renderConnect(main);
+  if (state.view === 'structure') return renderStructure(main);
+  if (state.view === 'database') return renderDatabase(main);
   if (state.view === 'map') return renderMap(main);
   if (state.view === 'sql') return renderSql(main);
   if (!state.table) {
@@ -342,7 +361,7 @@ function rowSelPk(row) {
 }
 async function loadColumns() {
   const r = await api(`/api/columns?schema=${encodeURIComponent(state.schema)}&table=${encodeURIComponent(state.table)}`);
-  state.columns = r.columns;
+  state.columns = applyColOrder(r.columns);
   state.primaryKey = r.primaryKey;
   state.outgoingFks = r.outgoingFks || [];
   state.incomingFks = r.incomingFks || [];
@@ -394,6 +413,10 @@ function renderTable(root) {
     class: 'primary',
     onclick: () => openRowEditor({ mode: 'insert' }),
   }, '+ Insert row'));
+  toolbar.appendChild(el('button', {
+    title: 'Manage columns, indexes and constraints',
+    onclick: () => { state.view = 'structure'; renderSide(); renderMain(); },
+  }, 'Structure'));
   toolbar.appendChild(el('button', {
     onclick: () => openBulkGenerator(),
     title: 'Insert many rows with random data',
@@ -891,6 +914,1092 @@ function openRowEditor({ mode, row }) {
       },
     ],
   });
+}
+
+// ---------------- Structure view (schema management / DDL) ----------------
+const COMMON_TYPES = [
+  'text', 'varchar(255)', 'char(1)', 'integer', 'bigint', 'smallint', 'serial', 'bigserial',
+  'numeric(10,2)', 'real', 'double precision', 'boolean', 'date', 'time',
+  'timestamp', 'timestamptz', 'interval', 'uuid', 'json', 'jsonb', 'inet',
+  'text[]', 'integer[]', 'uuid[]',
+];
+const CONTYPE_LABEL = {
+  p: 'PRIMARY KEY', f: 'FOREIGN KEY', u: 'UNIQUE', c: 'CHECK', x: 'EXCLUDE', t: 'TRIGGER',
+};
+
+// ----- Column display order (browser-local; the database is not touched) -----
+// Postgres cannot reorder columns in place, so this is a per-table view preference.
+// Use "Rebuild table in this order" to make it physical.
+function colOrderKey(schema = state.schema, table = state.table) {
+  return `pb.colorder.${schema}.${table}`;
+}
+function loadColOrder() {
+  try {
+    const v = JSON.parse(localStorage.getItem(colOrderKey()));
+    return Array.isArray(v) && v.length ? v : null;
+  } catch (_) { return null; }
+}
+function saveColOrder(names) {
+  try { localStorage.setItem(colOrderKey(), JSON.stringify(names)); } catch (_) { /* quota */ }
+}
+function clearColOrder() {
+  try { localStorage.removeItem(colOrderKey()); } catch (_) { /* ignore */ }
+}
+// Known columns first, in the saved order; columns added since then keep their
+// catalog order and land at the end (Array#sort is stable).
+function applyColOrder(cols) {
+  const order = loadColOrder();
+  if (!order) return cols;
+  const pos = new Map(order.map((n, i) => [n, i]));
+  return [...cols].sort((a, b) => {
+    const ai = pos.has(a.column_name) ? pos.get(a.column_name) : Infinity;
+    const bi = pos.has(b.column_name) ? pos.get(b.column_name) : Infinity;
+    return ai - bi;
+  });
+}
+function moveColumn(from, to) {
+  if (from == null || to == null || from === to) return;
+  const cols = [...state.columns];
+  if (from < 0 || from >= cols.length || to < 0 || to >= cols.length) return;
+  const [m] = cols.splice(from, 1);
+  cols.splice(to, 0, m);
+  state.columns = cols;
+  saveColOrder(cols.map(c => c.column_name));
+  renderMain();
+}
+
+function fieldRow(labelText, inputEl, hint) {
+  const f = el('div', { class: 'field' });
+  f.appendChild(el('label', {}, labelText));
+  f.appendChild(inputEl);
+  if (hint) f.appendChild(el('div', { class: 'hint' }, hint));
+  return f;
+}
+
+// A type <input> backed by a datalist: suggestions, but any valid type may be typed.
+function typeInput(value = '') {
+  const id = 'types-' + Math.random().toString(36).slice(2, 9);
+  const input = el('input', { type: 'text', list: id, spellcheck: 'false', placeholder: 'text' });
+  input.value = value;
+  const dl = el('datalist', { id });
+  for (const t of COMMON_TYPES) dl.appendChild(el('option', { value: t }));
+  const box = el('div', {});
+  box.appendChild(input); box.appendChild(dl);
+  return { box, input };
+}
+
+async function loadStructure() {
+  if (!state.table) { state.indexes = []; state.constraints = []; return; }
+  const q = `schema=${encodeURIComponent(state.schema)}&table=${encodeURIComponent(state.table)}`;
+  const [ix, cons] = await Promise.all([
+    api(`/api/indexes?${q}`).catch(() => ({ indexes: [] })),
+    api(`/api/constraints?${q}`).catch(() => ({ constraints: [] })),
+  ]);
+  state.indexes = ix.indexes || [];
+  state.constraints = cons.constraints || [];
+}
+
+// Refresh app state after a DDL change, then re-render.
+async function afterDdl({ reloadTables = false, table } = {}) {
+  if (reloadTables) await loadTables();
+  if (table !== undefined) state.table = table;
+  const exists = state.table && state.tables.some(t => t.table_name === state.table);
+  if (exists) {
+    await loadColumns();
+    await loadStructure();
+  } else {
+    state.table = null; state.columns = []; state.indexes = []; state.constraints = [];
+  }
+  renderSide(); renderMain();
+}
+
+function renderStructure(root) {
+  const wrap = el('div', { class: 'struct-wrap' });
+  root.appendChild(wrap);
+
+  if (!state.table) {
+    wrap.appendChild(el('div', { class: 'empty' }, 'Select a table from the left to manage it, or create a new one.'));
+    const b = el('button', { class: 'primary', onclick: () => openCreateTable() }, '+ New table');
+    wrap.appendChild(el('div', { style: 'text-align:center' }, b));
+    return;
+  }
+  fillStructure(wrap);
+}
+
+async function fillStructure(wrap) {
+  wrap.innerHTML = '';
+  const tb = el('div', { class: 'toolbar' });
+  tb.appendChild(el('span', { class: 'title' }, `${state.schema}.${state.table}`));
+  tb.appendChild(el('button', { onclick: () => openCreateTable() }, '+ New table'));
+  tb.appendChild(el('button', { onclick: () => openRenameTable() }, 'Rename'));
+  tb.appendChild(el('button', { onclick: () => openTruncateTable() }, 'Truncate'));
+  tb.appendChild(el('button', { class: 'danger', onclick: () => openDropTable() }, 'Drop table'));
+  tb.appendChild(el('button', { onclick: () => afterDdl() }, 'Refresh'));
+  wrap.appendChild(tb);
+
+  try { await loadStructure(); } catch (_) { /* sections render empty */ }
+
+  // ----- Columns -----
+  const colSec = el('div', { class: 'struct-sec' });
+  const customOrder = !!loadColOrder();
+  const colHead = el('div', { class: 'struct-head' },
+    el('h3', {}, `Columns (${state.columns.length})`),
+    customOrder ? el('span', { class: 'muted-note', title: 'Display order differs from the database order' }, 'custom order') : null,
+    el('button', { class: 'sm', onclick: () => openAddColumn() }, '+ Add column'),
+    el('button', {
+      class: 'sm', title: 'Physically rewrite the table in this column order',
+      onclick: () => openRebuildTable(),
+    }, 'Apply order to DB'),
+  );
+  if (customOrder) {
+    colHead.appendChild(el('button', {
+      class: 'sm', title: 'Restore the database column order',
+      onclick: async () => { clearColOrder(); await afterDdl(); },
+    }, 'Reset order'));
+  }
+  colSec.appendChild(colHead);
+  colSec.appendChild(el('div', { class: 'hint' },
+    'Drag a row (or use ↑ ↓) to reorder columns for display. This is saved in your browser only — use "Apply order to DB" to make it physical.'));
+
+  const ct = el('table', { class: 'data' });
+  ct.appendChild(el('thead', {}, el('tr', {},
+    el('th', { class: 'drag-col' }, ''), el('th', {}, 'Name'), el('th', {}, 'Type'),
+    el('th', {}, 'Nullable'), el('th', {}, 'Default'), el('th', {}, ''))));
+  const cb = el('tbody');
+  let dragFrom = null;
+  state.columns.forEach((c, i) => {
+    const isPk = (state.primaryKey || []).includes(c.column_name);
+    // `draggable` is an enumerated attribute, not a boolean one: it must be the
+    // string "true". Passing boolean true would emit draggable="" (i.e. "auto"),
+    // which is not draggable.
+    const tr = el('tr', { draggable: 'true', class: 'col-row' },
+      el('td', { class: 'drag-col', title: 'Drag to reorder' }, '⠿'),
+      el('td', {}, c.column_name + (isPk ? ' 🔑' : '')),
+      el('td', {}, c.data_type === 'ARRAY' ? `${String(c.udt_name || '').replace(/^_/, '')}[]` : c.data_type),
+      el('td', {}, c.is_nullable === 'YES' ? 'yes' : 'no'),
+      el('td', {}, c.column_default == null ? '—' : String(c.column_default)),
+      el('td', { class: 'actions' },
+        el('button', { title: 'Move up', disabled: i === 0 || undefined, onclick: () => moveColumn(i, i - 1) }, '↑'),
+        el('button', { title: 'Move down', disabled: i === state.columns.length - 1 || undefined, onclick: () => moveColumn(i, i + 1) }, '↓'),
+        el('button', { onclick: () => openEditColumn(c) }, 'Edit'),
+        el('button', { class: 'danger', onclick: () => dropColumn(c) }, 'Drop'),
+      ),
+    );
+    tr.addEventListener('dragstart', (e) => {
+      dragFrom = i;
+      tr.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Firefox requires data to be set for a drag to start.
+      try { e.dataTransfer.setData('text/plain', String(i)); } catch (_) { /* ignore */ }
+    });
+    tr.addEventListener('dragend', () => { tr.classList.remove('dragging'); dragFrom = null; });
+    tr.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; tr.classList.add('drag-over'); });
+    tr.addEventListener('dragleave', () => tr.classList.remove('drag-over'));
+    tr.addEventListener('drop', (e) => {
+      e.preventDefault();
+      tr.classList.remove('drag-over');
+      const from = dragFrom != null ? dragFrom : Number(e.dataTransfer.getData('text/plain'));
+      moveColumn(from, i);
+    });
+    cb.appendChild(tr);
+  });
+  ct.appendChild(cb);
+  colSec.appendChild(ct);
+  wrap.appendChild(colSec);
+
+  // ----- Indexes -----
+  const ixSec = el('div', { class: 'struct-sec' });
+  ixSec.appendChild(el('div', { class: 'struct-head' },
+    el('h3', {}, `Indexes (${state.indexes.length})`),
+    el('button', { class: 'sm', onclick: () => openCreateIndex() }, '+ Create index'),
+  ));
+  const it = el('table', { class: 'data' });
+  it.appendChild(el('thead', {}, el('tr', {},
+    el('th', {}, 'Name'), el('th', {}, 'Kind'), el('th', {}, 'Method'),
+    el('th', {}, 'Definition'), el('th', {}, ''))));
+  const ib = el('tbody');
+  for (const ix of state.indexes) {
+    const kind = ix.is_primary ? 'primary' : (ix.is_unique ? 'unique' : 'index');
+    ib.appendChild(el('tr', {},
+      el('td', {}, ix.name),
+      el('td', {}, kind),
+      el('td', {}, ix.method || ''),
+      el('td', { class: 'mono', title: ix.definition }, ix.definition || ''),
+      el('td', { class: 'actions' },
+        ix.is_primary
+          ? el('span', { class: 'muted-note', title: 'Backed by a constraint — drop the constraint instead' }, 'constraint')
+          : el('button', { class: 'danger', onclick: () => dropIndex(ix) }, 'Drop'),
+      ),
+    ));
+  }
+  if (state.indexes.length === 0) ib.appendChild(el('tr', {}, el('td', { colspan: '5' }, el('span', { class: 'null' }, 'No indexes'))));
+  it.appendChild(ib);
+  ixSec.appendChild(it);
+  wrap.appendChild(ixSec);
+
+  // ----- Constraints -----
+  const coSec = el('div', { class: 'struct-sec' });
+  coSec.appendChild(el('div', { class: 'struct-head' },
+    el('h3', {}, `Constraints (${state.constraints.length})`),
+    el('button', { class: 'sm', onclick: () => openAddConstraint() }, '+ Add constraint'),
+  ));
+  const ot = el('table', { class: 'data' });
+  ot.appendChild(el('thead', {}, el('tr', {},
+    el('th', {}, 'Name'), el('th', {}, 'Type'), el('th', {}, 'Definition'), el('th', {}, ''))));
+  const ob = el('tbody');
+  for (const con of state.constraints) {
+    ob.appendChild(el('tr', {},
+      el('td', {}, con.name),
+      el('td', {}, CONTYPE_LABEL[con.type] || con.type),
+      el('td', { class: 'mono', title: con.definition }, con.definition || ''),
+      el('td', { class: 'actions' },
+        el('button', { class: 'danger', onclick: () => dropConstraint(con) }, 'Drop')),
+    ));
+  }
+  if (state.constraints.length === 0) ob.appendChild(el('tr', {}, el('td', { colspan: '4' }, el('span', { class: 'null' }, 'No constraints'))));
+  ot.appendChild(ob);
+  coSec.appendChild(ot);
+  wrap.appendChild(coSec);
+}
+
+// ----- DDL actions -----
+async function ddl(path, body) {
+  return api('/api/ddl/' + path, { method: 'POST', body: { schema: state.schema, ...body } });
+}
+
+function openCreateTable() {
+  const body = el('div');
+  const nameInput = el('input', { type: 'text', placeholder: 'my_table', spellcheck: 'false' });
+  body.appendChild(fieldRow('Table name', nameInput));
+
+  const rows = [];
+  const rowsWrap = el('div', { class: 'col-defs' });
+  function addRow(preset = {}) {
+    const row = el('div', { class: 'col-def' });
+    const n = el('input', { type: 'text', placeholder: 'column_name', spellcheck: 'false' });
+    n.value = preset.name || '';
+    const { box: tBox, input: tIn } = typeInput(preset.type || '');
+    const nn = el('input', { type: 'checkbox' });
+    nn.checked = !!preset.notNull;
+    const pk = el('input', { type: 'checkbox' });
+    pk.checked = !!preset.primaryKey;
+    const dv = el('input', { type: 'text', placeholder: 'default', spellcheck: 'false' });
+    dv.value = preset.default || '';
+    const del = el('button', { class: 'ghost sm danger', title: 'Remove column' }, icon('trash'));
+    const entry = { name: n, type: tIn, notNull: nn, pk, def: dv, row };
+    del.addEventListener('click', () => {
+      const i = rows.indexOf(entry);
+      if (i >= 0) rows.splice(i, 1);
+      row.remove();
+    });
+    row.appendChild(n);
+    row.appendChild(tBox);
+    row.appendChild(dv);
+    row.appendChild(el('label', { class: 'inline-cb', title: 'NOT NULL' }, nn, el('span', {}, 'NN')));
+    row.appendChild(el('label', { class: 'inline-cb', title: 'PRIMARY KEY' }, pk, el('span', {}, 'PK')));
+    row.appendChild(del);
+    rows.push(entry);
+    rowsWrap.appendChild(row);
+  }
+  body.appendChild(el('label', {}, 'Columns'));
+  body.appendChild(rowsWrap);
+  addRow({ name: 'id', type: 'bigserial', primaryKey: true, notNull: true });
+  addRow({ name: '', type: 'text' });
+  const addBtn = el('button', { class: 'sm', onclick: () => addRow({ type: 'text' }) }, '+ Add column');
+  body.appendChild(addBtn);
+
+  modal({
+    title: 'Create table',
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Create', class: 'primary',
+        onClick: async (close) => {
+          try {
+            const table = nameInput.value.trim();
+            if (!table) throw new Error('Table name is required');
+            const columns = rows
+              .filter(r => r.name.value.trim())
+              .map(r => ({
+                name: r.name.value.trim(),
+                type: r.type.value.trim() || 'text',
+                notNull: r.notNull.checked,
+                primaryKey: r.pk.checked,
+                default: r.def.value.trim(),
+              }));
+            if (columns.length === 0) throw new Error('At least one column is required');
+            await ddl('table/create', { table, columns });
+            close();
+            await afterDdl({ reloadTables: true, table });
+          } catch (e) { alert('Create table failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openRenameTable() {
+  const input = el('input', { type: 'text', spellcheck: 'false' });
+  input.value = state.table;
+  const body = el('div', {}, fieldRow('New table name', input));
+  modal({
+    title: `Rename ${state.table}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Rename', class: 'primary',
+        onClick: async (close) => {
+          try {
+            const newName = input.value.trim();
+            if (!newName) throw new Error('Name is required');
+            await ddl('table/rename', { table: state.table, newName });
+            close();
+            await afterDdl({ reloadTables: true, table: newName });
+          } catch (e) { alert('Rename failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openTruncateTable() {
+  const cascade = el('input', { type: 'checkbox' });
+  const restart = el('input', { type: 'checkbox' });
+  const body = el('div', {},
+    el('p', { class: 'hint' }, `This permanently deletes every row in ${state.schema}.${state.table}. The table itself is kept.`),
+    el('label', { class: 'inline-cb' }, cascade, el('span', {}, 'CASCADE (also truncate tables referencing this one)')),
+    el('label', { class: 'inline-cb' }, restart, el('span', {}, 'RESTART IDENTITY (reset sequences)')),
+  );
+  modal({
+    title: `Truncate ${state.table}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Truncate', class: 'danger',
+        onClick: async (close) => {
+          try {
+            await ddl('table/truncate', { table: state.table, cascade: cascade.checked, restartIdentity: restart.checked });
+            close();
+            await afterDdl();
+          } catch (e) { alert('Truncate failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openDropTable() {
+  const cascade = el('input', { type: 'checkbox' });
+  const confirmIn = el('input', { type: 'text', placeholder: state.table, spellcheck: 'false' });
+  const body = el('div', {},
+    el('p', { class: 'hint' }, `This permanently drops ${state.schema}.${state.table} and all its data. Type the table name to confirm.`),
+    confirmIn,
+    el('label', { class: 'inline-cb' }, cascade, el('span', {}, 'CASCADE (also drop dependent objects)')),
+  );
+  modal({
+    title: `Drop ${state.table}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Drop table', class: 'danger',
+        onClick: async (close) => {
+          try {
+            if (confirmIn.value.trim() !== state.table) throw new Error('Table name does not match');
+            await ddl('table/drop', { table: state.table, cascade: cascade.checked });
+            close();
+            await afterDdl({ reloadTables: true, table: null });
+          } catch (e) { alert('Drop failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openRebuildTable() {
+  const order = state.columns.map(c => c.column_name);
+  const confirmIn = el('input', { type: 'text', placeholder: state.table, spellcheck: 'false' });
+  const orderBox = el('div', { class: 'mono rebuild-order' },
+    order.map((n, i) => `${String(i + 1).padStart(2, ' ')}. ${n}`).join('\n'));
+  const body = el('div', {},
+    el('p', { class: 'hint' }, 'Postgres cannot reorder columns in place. This recreates the table in the order below and copies every row — all inside one transaction, so it rolls back completely if anything fails.'),
+    el('label', {}, 'New column order'),
+    orderBox,
+    el('p', { class: 'hint' }, 'Preserved: types, NOT NULL, defaults, identity/serial values, PK / unique / check / FK, incoming FKs from other tables, indexes and triggers.'),
+    el('p', { class: 'hint' }, 'NOT preserved: grants, RLS policies, comments. Refused if any view depends on this table, or if it uses inheritance/partitioning.'),
+    el('p', { class: 'hint' }, 'The table is locked for the duration. Take a backup first. Type the table name to confirm.'),
+    confirmIn,
+  );
+  modal({
+    title: `Rebuild ${state.table} in this order`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Rebuild table', class: 'danger',
+        onClick: async (close) => {
+          try {
+            if (confirmIn.value.trim() !== state.table) throw new Error('Table name does not match');
+            await ddl('table/rebuild', { table: state.table, columns: order });
+            // Physical order now matches, so the local override is redundant.
+            clearColOrder();
+            close();
+            await afterDdl();
+          } catch (e) { alert('Rebuild failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openAddColumn() {
+  const name = el('input', { type: 'text', placeholder: 'column_name', spellcheck: 'false' });
+  const { box: tBox, input: tIn } = typeInput('text');
+  const notNull = el('input', { type: 'checkbox' });
+  const def = el('input', { type: 'text', placeholder: "e.g. now()  |  0  |  'x'", spellcheck: 'false' });
+  const body = el('div', {},
+    fieldRow('Name', name),
+    fieldRow('Type', tBox),
+    fieldRow('Default expression', def, 'Raw SQL, left blank for none.'),
+    el('label', { class: 'inline-cb' }, notNull, el('span', {}, 'NOT NULL')),
+  );
+  modal({
+    title: `Add column to ${state.table}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Add', class: 'primary',
+        onClick: async (close) => {
+          try {
+            if (!name.value.trim()) throw new Error('Name is required');
+            await ddl('column/add', {
+              table: state.table, name: name.value.trim(), type: tIn.value.trim() || 'text',
+              notNull: notNull.checked, default: def.value.trim(),
+            });
+            close();
+            await afterDdl();
+          } catch (e) { alert('Add column failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openEditColumn(c) {
+  const name = el('input', { type: 'text', spellcheck: 'false' });
+  name.value = c.column_name;
+  const curType = c.data_type === 'ARRAY' ? `${String(c.udt_name || '').replace(/^_/, '')}[]` : c.data_type;
+  const { box: tBox, input: tIn } = typeInput(curType);
+  const notNull = el('input', { type: 'checkbox' });
+  notNull.checked = c.is_nullable !== 'YES';
+  const def = el('input', { type: 'text', spellcheck: 'false' });
+  def.value = c.column_default == null ? '' : String(c.column_default);
+  const dropDef = el('input', { type: 'checkbox' });
+  dropDef.addEventListener('change', () => { def.disabled = dropDef.checked; });
+
+  const body = el('div', {},
+    fieldRow('Name', name),
+    fieldRow('Type', tBox, 'Changing type re-casts existing values (USING col::type).'),
+    fieldRow('Default expression', def),
+    el('label', { class: 'inline-cb' }, dropDef, el('span', {}, 'Drop default')),
+    el('label', { class: 'inline-cb' }, notNull, el('span', {}, 'NOT NULL')),
+  );
+  modal({
+    title: `Edit column ${c.column_name}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Save', class: 'primary',
+        onClick: async (close) => {
+          try {
+            const payload = { table: state.table, column: c.column_name };
+            const newName = name.value.trim();
+            if (newName && newName !== c.column_name) payload.newName = newName;
+            const newType = tIn.value.trim();
+            if (newType && newType !== curType) payload.type = newType;
+            const wasNotNull = c.is_nullable !== 'YES';
+            if (notNull.checked !== wasNotNull) payload.notNull = notNull.checked;
+            if (dropDef.checked) payload.dropDefault = true;
+            else if (def.value.trim() && def.value.trim() !== String(c.column_default ?? '')) payload.default = def.value.trim();
+            await ddl('column/alter', payload);
+            close();
+            await afterDdl();
+          } catch (e) { alert('Alter column failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+async function dropColumn(c) {
+  if (!confirm(`Drop column "${c.column_name}" and all its data?`)) return;
+  try {
+    await ddl('column/drop', { table: state.table, column: c.column_name });
+    await afterDdl();
+  } catch (e) {
+    if (/depend|cannot be dropped/i.test(e.message) && confirm(`${e.message}\n\nRetry with CASCADE (drops dependent objects)?`)) {
+      try { await ddl('column/drop', { table: state.table, column: c.column_name, cascade: true }); await afterDdl(); }
+      catch (e2) { alert('Drop column failed: ' + e2.message); }
+    } else { alert('Drop column failed: ' + e.message); }
+  }
+}
+
+function openCreateIndex() {
+  const name = el('input', { type: 'text', spellcheck: 'false' });
+  name.value = `${state.table}_idx`;
+  const colSel = el('select', { multiple: true, size: String(Math.min(8, Math.max(3, state.columns.length))) });
+  for (const c of state.columns) colSel.appendChild(el('option', { value: c.column_name }, c.column_name));
+  const unique = el('input', { type: 'checkbox' });
+  const method = el('select');
+  for (const m of ['btree', 'hash', 'gist', 'gin', 'spgist', 'brin']) method.appendChild(el('option', { value: m }, m));
+
+  const body = el('div', {},
+    fieldRow('Index name', name),
+    fieldRow('Columns', colSel, 'Ctrl/Cmd-click to select multiple (order matters).'),
+    fieldRow('Method', method),
+    el('label', { class: 'inline-cb' }, unique, el('span', {}, 'UNIQUE')),
+  );
+  modal({
+    title: `Create index on ${state.table}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Create', class: 'primary',
+        onClick: async (close) => {
+          try {
+            const columns = [...colSel.selectedOptions].map(o => o.value);
+            if (columns.length === 0) throw new Error('Select at least one column');
+            if (!name.value.trim()) throw new Error('Index name is required');
+            await ddl('index/create', {
+              table: state.table, name: name.value.trim(), columns,
+              unique: unique.checked, method: method.value,
+            });
+            close();
+            await afterDdl();
+          } catch (e) { alert('Create index failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+async function dropIndex(ix) {
+  if (!confirm(`Drop index "${ix.name}"?`)) return;
+  try { await ddl('index/drop', { name: ix.name }); await afterDdl(); }
+  catch (e) { alert('Drop index failed: ' + e.message); }
+}
+
+function openAddConstraint() {
+  const name = el('input', { type: 'text', spellcheck: 'false' });
+  let nameTouched = false;
+  name.addEventListener('input', () => { nameTouched = true; });
+
+  const typeSel = el('select');
+  for (const [v, l] of [['unique', 'UNIQUE'], ['pk', 'PRIMARY KEY'], ['check', 'CHECK'], ['fk', 'FOREIGN KEY']]) {
+    typeSel.appendChild(el('option', { value: v }, l));
+  }
+  const colSel = el('select', { multiple: true, size: '5' });
+  for (const c of state.columns) colSel.appendChild(el('option', { value: c.column_name }, c.column_name));
+  const expr = el('textarea', { spellcheck: 'false', placeholder: 'price > 0' });
+
+  const refSchemaSel = el('select');
+  const refTableSel = el('select');
+  const refColSel = el('select', { multiple: true, size: '5' });
+  const onDel = el('select'), onUpd = el('select');
+  for (const a of ['NO ACTION', 'RESTRICT', 'CASCADE', 'SET NULL', 'SET DEFAULT']) {
+    onDel.appendChild(el('option', { value: a }, a));
+    onUpd.appendChild(el('option', { value: a }, a));
+  }
+  for (const s of state.schemas) {
+    const o = el('option', { value: s }, s);
+    if (s === state.schema) o.selected = true;
+    refSchemaSel.appendChild(o);
+  }
+  async function loadRefCols() {
+    refColSel.innerHTML = '';
+    if (!refTableSel.value) return;
+    try {
+      const r = await api(`/api/columns?schema=${encodeURIComponent(refSchemaSel.value)}&table=${encodeURIComponent(refTableSel.value)}`);
+      for (const c of r.columns) refColSel.appendChild(el('option', { value: c.column_name }, c.column_name));
+      for (const o of refColSel.options) if ((r.primaryKey || []).includes(o.value)) o.selected = true;
+    } catch (_) { /* leave empty */ }
+  }
+  async function loadRefTables() {
+    refTableSel.innerHTML = ''; refColSel.innerHTML = '';
+    try {
+      const r = await api(`/api/tables?schema=${encodeURIComponent(refSchemaSel.value)}`);
+      for (const t of r.tables) refTableSel.appendChild(el('option', { value: t.table_name }, t.table_name));
+      await loadRefCols();
+    } catch (_) { /* leave empty */ }
+  }
+  refSchemaSel.addEventListener('change', loadRefTables);
+  refTableSel.addEventListener('change', loadRefCols);
+
+  const colField = fieldRow('Columns', colSel, 'Ctrl/Cmd-click for multiple (order matters).');
+  const exprField = fieldRow('Check expression', expr);
+  const fkWrap = el('div', {},
+    fieldRow('References schema', refSchemaSel),
+    fieldRow('References table', refTableSel),
+    fieldRow('References columns', refColSel),
+    fieldRow('ON DELETE', onDel),
+    fieldRow('ON UPDATE', onUpd),
+  );
+  function sync() {
+    const t = typeSel.value;
+    colField.style.display = t === 'check' ? 'none' : '';
+    exprField.style.display = t === 'check' ? '' : 'none';
+    fkWrap.style.display = t === 'fk' ? '' : 'none';
+    if (!nameTouched) name.value = `${state.table}_${t}`;
+    if (t === 'fk' && refTableSel.options.length === 0) loadRefTables();
+  }
+  typeSel.addEventListener('change', sync);
+
+  const body = el('div', {}, fieldRow('Name', name), fieldRow('Type', typeSel), colField, exprField, fkWrap);
+  sync();
+
+  modal({
+    title: `Add constraint to ${state.table}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Add', class: 'primary',
+        onClick: async (close) => {
+          try {
+            if (!name.value.trim()) throw new Error('Name is required');
+            const type = typeSel.value;
+            const payload = { table: state.table, name: name.value.trim(), type };
+            if (type === 'check') {
+              if (!expr.value.trim()) throw new Error('Check expression is required');
+              payload.expression = expr.value.trim();
+            } else {
+              payload.columns = [...colSel.selectedOptions].map(o => o.value);
+              if (payload.columns.length === 0) throw new Error('Select at least one column');
+            }
+            if (type === 'fk') {
+              payload.refSchema = refSchemaSel.value;
+              payload.refTable = refTableSel.value;
+              payload.refColumns = [...refColSel.selectedOptions].map(o => o.value);
+              payload.onDelete = onDel.value;
+              payload.onUpdate = onUpd.value;
+              if (!payload.refTable) throw new Error('Choose a referenced table');
+              if (payload.refColumns.length === 0) throw new Error('Choose referenced column(s)');
+            }
+            await ddl('constraint/add', payload);
+            close();
+            await afterDdl();
+          } catch (e) { alert('Add constraint failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+async function dropConstraint(con) {
+  if (!confirm(`Drop constraint "${con.name}"?\n\n${con.definition || ''}`)) return;
+  try { await ddl('constraint/drop', { table: state.table, name: con.name }); await afterDdl(); }
+  catch (e) {
+    if (/depend/i.test(e.message) && confirm(`${e.message}\n\nRetry with CASCADE?`)) {
+      try { await ddl('constraint/drop', { table: state.table, name: con.name, cascade: true }); await afterDdl(); }
+      catch (e2) { alert('Drop constraint failed: ' + e2.message); }
+    } else { alert('Drop constraint failed: ' + e.message); }
+  }
+}
+
+// ---------------- Database view (schemas / views / functions / roles) ----------------
+async function rawDdl(path, body) {
+  return api('/api/ddl/' + path, { method: 'POST', body });
+}
+
+async function loadDbObjects() {
+  const q = `schema=${encodeURIComponent(state.schema)}`;
+  const [sc, vw, fn, rl] = await Promise.all([
+    api('/api/db/schemas').catch(() => ({ schemas: [] })),
+    api(`/api/db/views?${q}`).catch(() => ({ views: [] })),
+    api(`/api/db/functions?${q}`).catch(() => ({ functions: [] })),
+    api('/api/db/roles').catch(() => ({ roles: [] })),
+  ]);
+  state.dbSchemas = sc.schemas || [];
+  state.views = vw.views || [];
+  state.functions = fn.functions || [];
+  state.roles = rl.roles || [];
+}
+
+// Re-sync after a database-level change, then re-render.
+async function afterDbDdl({ reloadSchemas = false } = {}) {
+  if (reloadSchemas) {
+    try {
+      const r = await api('/api/schemas');
+      state.schemas = r.schemas || [];
+      if (!state.schemas.includes(state.schema)) {
+        state.schema = state.schemas[0] || 'public';
+        state.table = null; state.columns = [];
+        await loadTables();
+      }
+    } catch (_) { /* keep current */ }
+  }
+  renderSide(); renderMain();
+}
+
+function renderDatabase(root) {
+  const wrap = el('div', { class: 'struct-wrap' });
+  root.appendChild(wrap);
+  fillDatabase(wrap);
+}
+
+function objTable(headers, rows) {
+  const t = el('table', { class: 'data' });
+  t.appendChild(el('thead', {}, el('tr', {}, ...headers.map(h => el('th', {}, h)))));
+  const tb = el('tbody');
+  for (const r of rows) tb.appendChild(r);
+  if (rows.length === 0) {
+    tb.appendChild(el('tr', {}, el('td', { colspan: String(headers.length) }, el('span', { class: 'null' }, 'None'))));
+  }
+  t.appendChild(tb);
+  return t;
+}
+
+async function fillDatabase(wrap) {
+  wrap.innerHTML = '';
+  const tb = el('div', { class: 'toolbar' });
+  tb.appendChild(el('span', { class: 'title' }, `Database — ${state.info ? state.info.db : ''}`));
+  tb.appendChild(el('button', { onclick: () => fillDatabase(wrap) }, 'Refresh'));
+  wrap.appendChild(tb);
+
+  try { await loadDbObjects(); } catch (_) { /* sections render empty */ }
+
+  // ----- Schemas -----
+  const sSec = el('div', { class: 'struct-sec' });
+  sSec.appendChild(el('div', { class: 'struct-head' },
+    el('h3', {}, `Schemas (${state.dbSchemas.length})`),
+    el('button', { class: 'sm', onclick: () => openCreateSchema() }, '+ Create schema'),
+  ));
+  sSec.appendChild(objTable(['Name', 'Owner', ''], state.dbSchemas.map(s => el('tr', {},
+    el('td', {}, s.name),
+    el('td', {}, s.owner || ''),
+    el('td', { class: 'actions' },
+      el('button', { onclick: () => openRenameSchema(s) }, 'Rename'),
+      el('button', { class: 'danger', onclick: () => dropSchema(s) }, 'Drop'),
+    ),
+  ))));
+  wrap.appendChild(sSec);
+
+  // ----- Views -----
+  const vSec = el('div', { class: 'struct-sec' });
+  vSec.appendChild(el('div', { class: 'struct-head' },
+    el('h3', {}, `Views in ${state.schema} (${state.views.length})`),
+    el('button', { class: 'sm', onclick: () => openCreateView() }, '+ Create view'),
+  ));
+  vSec.appendChild(objTable(['Name', 'Kind', 'Owner', 'Definition', ''], state.views.map(v => el('tr', {},
+    el('td', {}, v.name),
+    el('td', {}, v.kind === 'm' ? 'materialized' : 'view'),
+    el('td', {}, v.owner || ''),
+    el('td', { class: 'mono', title: v.definition }, (v.definition || '').replace(/\s+/g, ' ').slice(0, 120)),
+    el('td', { class: 'actions' },
+      el('button', { onclick: () => showSource(`${v.name} — definition`, v.definition || '') }, 'Source'),
+      v.kind === 'm' ? el('button', { onclick: () => refreshView(v) }, 'Refresh') : null,
+      el('button', { class: 'danger', onclick: () => dropView(v) }, 'Drop'),
+    ),
+  ))));
+  wrap.appendChild(vSec);
+
+  // ----- Functions -----
+  const fSec = el('div', { class: 'struct-sec' });
+  fSec.appendChild(el('div', { class: 'struct-head' },
+    el('h3', {}, `Functions in ${state.schema} (${state.functions.length})`),
+    el('button', { class: 'sm', onclick: () => openCreateFunction() }, '+ Create function'),
+  ));
+  fSec.appendChild(objTable(['Name', 'Arguments', 'Returns', 'Lang', ''], state.functions.map(f => el('tr', {},
+    el('td', {}, f.name),
+    el('td', { class: 'mono', title: f.args }, f.args || ''),
+    el('td', { class: 'mono' }, f.kind === 'p' ? 'procedure' : (f.returns || '')),
+    el('td', {}, f.language || ''),
+    el('td', { class: 'actions' },
+      el('button', { onclick: () => showFunctionSource(f) }, 'Source'),
+      el('button', { class: 'danger', onclick: () => dropFunction(f) }, 'Drop'),
+    ),
+  ))));
+  wrap.appendChild(fSec);
+
+  // ----- Roles -----
+  const rSec = el('div', { class: 'struct-sec' });
+  rSec.appendChild(el('div', { class: 'struct-head' },
+    el('h3', {}, `Roles (${state.roles.length})`),
+    el('button', { class: 'sm', onclick: () => openCreateRole() }, '+ Create role'),
+  ));
+  rSec.appendChild(objTable(['Name', 'Attributes', 'Conn limit', ''], state.roles.map(r => el('tr', {},
+    el('td', {}, r.name),
+    el('td', { class: 'muted-note' }, roleAttrs(r) || '—'),
+    el('td', {}, r.connlimit === -1 ? '∞' : String(r.connlimit)),
+    el('td', { class: 'actions' },
+      el('button', { onclick: () => openEditRole(r) }, 'Edit'),
+      el('button', { class: 'danger', onclick: () => dropRole(r) }, 'Drop'),
+    ),
+  ))));
+  wrap.appendChild(rSec);
+}
+
+function roleAttrs(r) {
+  const a = [];
+  if (r.superuser) a.push('SUPERUSER');
+  if (r.createdb) a.push('CREATEDB');
+  if (r.createrole) a.push('CREATEROLE');
+  if (r.login) a.push('LOGIN');
+  if (r.replication) a.push('REPLICATION');
+  if (!r.inherit) a.push('NOINHERIT');
+  return a.join(', ');
+}
+
+function showSource(title, text) {
+  const ta = el('textarea', { spellcheck: 'false', readonly: true, style: 'min-height:320px' });
+  ta.value = text;
+  modal({ title, body: el('div', {}, ta), actions: [{ label: 'Close', onClick: (close) => close() }] });
+}
+
+async function showFunctionSource(f) {
+  try {
+    const r = await api(`/api/db/function-def?oid=${encodeURIComponent(f.oid)}`);
+    showSource(`${f.name}(${f.args || ''})`, r.definition || '(source unavailable)');
+  } catch (e) { alert('Could not load source: ' + e.message); }
+}
+
+// ----- Schema actions -----
+function openCreateSchema() {
+  const name = el('input', { type: 'text', placeholder: 'analytics', spellcheck: 'false' });
+  modal({
+    title: 'Create schema',
+    body: el('div', {}, fieldRow('Schema name', name)),
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Create', class: 'primary',
+        onClick: async (close) => {
+          try {
+            if (!name.value.trim()) throw new Error('Name is required');
+            await rawDdl('schema/create', { name: name.value.trim() });
+            close();
+            await afterDbDdl({ reloadSchemas: true });
+          } catch (e) { alert('Create schema failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openRenameSchema(s) {
+  const name = el('input', { type: 'text', spellcheck: 'false' });
+  name.value = s.name;
+  modal({
+    title: `Rename schema ${s.name}`,
+    body: el('div', {}, fieldRow('New name', name)),
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Rename', class: 'primary',
+        onClick: async (close) => {
+          try {
+            if (!name.value.trim()) throw new Error('Name is required');
+            await rawDdl('schema/rename', { name: s.name, newName: name.value.trim() });
+            if (state.schema === s.name) state.schema = name.value.trim();
+            close();
+            await afterDbDdl({ reloadSchemas: true });
+          } catch (e) { alert('Rename schema failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+async function dropSchema(s) {
+  if (!confirm(`Drop schema "${s.name}"?\n\nThis fails unless the schema is empty; you will be offered CASCADE.`)) return;
+  try {
+    await rawDdl('schema/drop', { name: s.name });
+    await afterDbDdl({ reloadSchemas: true });
+  } catch (e) {
+    if (confirm(`${e.message}\n\nRetry with CASCADE? This drops every object inside "${s.name}".`)) {
+      try { await rawDdl('schema/drop', { name: s.name, cascade: true }); await afterDbDdl({ reloadSchemas: true }); }
+      catch (e2) { alert('Drop schema failed: ' + e2.message); }
+    }
+  }
+}
+
+// ----- View actions -----
+function openCreateView() {
+  const name = el('input', { type: 'text', placeholder: 'active_users', spellcheck: 'false' });
+  const sql = el('textarea', { spellcheck: 'false', placeholder: 'SELECT * FROM users WHERE active', style: 'min-height:160px' });
+  const mat = el('input', { type: 'checkbox' });
+  const rep = el('input', { type: 'checkbox' });
+  modal({
+    title: `Create view in ${state.schema}`,
+    body: el('div', {},
+      fieldRow('View name', name),
+      fieldRow('SELECT statement', sql, 'A single SELECT; no trailing semicolon needed.'),
+      el('label', { class: 'inline-cb' }, mat, el('span', {}, 'MATERIALIZED')),
+      el('label', { class: 'inline-cb' }, rep, el('span', {}, 'OR REPLACE (regular views only)')),
+    ),
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Create', class: 'primary',
+        onClick: async (close) => {
+          try {
+            if (!name.value.trim()) throw new Error('Name is required');
+            if (!sql.value.trim()) throw new Error('SELECT statement is required');
+            await ddl('view/create', {
+              name: name.value.trim(), sql: sql.value,
+              materialized: mat.checked, replace: rep.checked,
+            });
+            close();
+            await afterDbDdl();
+          } catch (e) { alert('Create view failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+async function dropView(v) {
+  if (!confirm(`Drop ${v.kind === 'm' ? 'materialized view' : 'view'} "${v.name}"?`)) return;
+  const materialized = v.kind === 'm';
+  try {
+    await ddl('view/drop', { name: v.name, materialized });
+    await afterDbDdl();
+  } catch (e) {
+    if (/depend/i.test(e.message) && confirm(`${e.message}\n\nRetry with CASCADE?`)) {
+      try { await ddl('view/drop', { name: v.name, materialized, cascade: true }); await afterDbDdl(); }
+      catch (e2) { alert('Drop view failed: ' + e2.message); }
+    } else { alert('Drop view failed: ' + e.message); }
+  }
+}
+
+async function refreshView(v) {
+  try { await ddl('view/refresh', { name: v.name }); await afterDbDdl(); }
+  catch (e) { alert('Refresh failed: ' + e.message); }
+}
+
+// ----- Function actions -----
+function openCreateFunction() {
+  const sql = el('textarea', { spellcheck: 'false', style: 'min-height:260px' });
+  sql.value = `CREATE OR REPLACE FUNCTION ${state.schema}.my_func(a integer)\nRETURNS integer\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  RETURN a * 2;\nEND;\n$$;`;
+  modal({
+    title: 'Create function / procedure',
+    body: el('div', {},
+      fieldRow('Statement', sql, 'The full CREATE FUNCTION or CREATE PROCEDURE statement.'),
+    ),
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Run', class: 'primary',
+        onClick: async (close) => {
+          try {
+            await rawDdl('function/create', { sql: sql.value });
+            close();
+            await afterDbDdl();
+          } catch (e) { alert('Create function failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+async function dropFunction(f) {
+  if (!confirm(`Drop ${f.kind === 'p' ? 'procedure' : 'function'} ${f.name}(${f.args || ''})?`)) return;
+  const payload = { name: f.name, args: f.args || '', procedure: f.kind === 'p' };
+  try { await ddl('function/drop', payload); await afterDbDdl(); }
+  catch (e) {
+    if (/depend/i.test(e.message) && confirm(`${e.message}\n\nRetry with CASCADE?`)) {
+      try { await ddl('function/drop', { ...payload, cascade: true }); await afterDbDdl(); }
+      catch (e2) { alert('Drop function failed: ' + e2.message); }
+    } else { alert('Drop function failed: ' + e.message); }
+  }
+}
+
+// ----- Role actions -----
+function roleFormFields(preset = {}) {
+  const login = el('input', { type: 'checkbox' }); login.checked = !!preset.login;
+  const superuser = el('input', { type: 'checkbox' }); superuser.checked = !!preset.superuser;
+  const createdb = el('input', { type: 'checkbox' }); createdb.checked = !!preset.createdb;
+  const createrole = el('input', { type: 'checkbox' }); createrole.checked = !!preset.createrole;
+  const inherit = el('input', { type: 'checkbox' }); inherit.checked = preset.inherit !== false;
+  const password = el('input', { type: 'password', autocomplete: 'new-password', placeholder: 'leave blank to keep unchanged' });
+  const connlimit = el('input', { type: 'number', placeholder: '-1 (unlimited)' });
+  if (preset.connlimit !== undefined && preset.connlimit !== null) connlimit.value = String(preset.connlimit);
+  const body = el('div', {},
+    fieldRow('Password', password),
+    fieldRow('Connection limit', connlimit),
+    el('label', { class: 'inline-cb' }, login, el('span', {}, 'LOGIN')),
+    el('label', { class: 'inline-cb' }, superuser, el('span', {}, 'SUPERUSER')),
+    el('label', { class: 'inline-cb' }, createdb, el('span', {}, 'CREATEDB')),
+    el('label', { class: 'inline-cb' }, createrole, el('span', {}, 'CREATEROLE')),
+    el('label', { class: 'inline-cb' }, inherit, el('span', {}, 'INHERIT')),
+  );
+  const collect = () => {
+    const o = {
+      login: login.checked, superuser: superuser.checked, createdb: createdb.checked,
+      createrole: createrole.checked, inherit: inherit.checked,
+    };
+    if (password.value) o.password = password.value;
+    if (connlimit.value !== '') o.connlimit = Number(connlimit.value);
+    return o;
+  };
+  return { body, collect };
+}
+
+function openCreateRole() {
+  const name = el('input', { type: 'text', placeholder: 'app_user', spellcheck: 'false' });
+  const { body: optBody, collect } = roleFormFields({ login: true, inherit: true });
+  const body = el('div', {}, fieldRow('Role name', name), optBody);
+  modal({
+    title: 'Create role',
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Create', class: 'primary',
+        onClick: async (close) => {
+          try {
+            if (!name.value.trim()) throw new Error('Name is required');
+            await rawDdl('role/create', { name: name.value.trim(), ...collect() });
+            close();
+            await afterDbDdl();
+          } catch (e) { alert('Create role failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+function openEditRole(r) {
+  const { body, collect } = roleFormFields(r);
+  modal({
+    title: `Edit role ${r.name}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Save', class: 'primary',
+        onClick: async (close) => {
+          try {
+            await rawDdl('role/alter', { name: r.name, ...collect() });
+            close();
+            await afterDbDdl();
+          } catch (e) { alert('Alter role failed: ' + e.message); }
+        },
+      },
+    ],
+  });
+}
+
+async function dropRole(r) {
+  if (!confirm(`Drop role "${r.name}"?\n\nThis fails if the role still owns objects.`)) return;
+  try { await rawDdl('role/drop', { name: r.name }); await afterDbDdl(); }
+  catch (e) { alert('Drop role failed: ' + e.message); }
 }
 
 // ---------------- Map view (schema diagram) ----------------

@@ -208,6 +208,57 @@ button.ghost:hover:not(:disabled) { opacity: 1; }
 .checkbox-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
 .checkbox-row input { width: auto; }
 
+/* ----- Structure view (schema management) ----- */
+.struct-wrap { padding: 12px 16px 32px; overflow: auto; }
+.struct-sec { margin-top: 22px; }
+.struct-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.struct-head h3 {
+  margin: 0; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .5px; color: var(--muted); flex: 1;
+}
+.struct-sec table.data { width: 100%; }
+.struct-sec .mono {
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
+  max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.muted-note { font-size: 11px; color: var(--muted); }
+.struct-sec .hint { font-size: 11px; color: var(--muted); margin: 0 0 8px; }
+
+/* drag-to-reorder columns */
+table.data th.drag-col, table.data td.drag-col {
+  width: 22px; text-align: center; color: var(--muted);
+  cursor: grab; user-select: none; padding-left: 6px; padding-right: 0;
+}
+tr.col-row.dragging { opacity: .45; }
+tr.col-row.drag-over td { border-top: 2px solid var(--fg); }
+table.data td.actions button:disabled { opacity: .3; cursor: default; }
+.rebuild-order {
+  white-space: pre; background: #fafafa; border: 1px solid var(--line);
+  padding: 8px 10px; max-height: 220px; overflow: auto; font-size: 11px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+button.sm { padding: 3px 8px; font-size: 11px; }
+
+/* sidebar section header with a trailing action button */
+aside.side .sec-head { display: flex; align-items: center; gap: 6px; }
+aside.side .sec-head h3 { margin: 0; flex: 1; }
+aside.side .sec-head button.sm { padding: 0 7px; font-size: 15px; line-height: 1.4; }
+
+/* modal: inline checkbox rows and create-table column grid */
+.modal .body label.inline-cb {
+  display: flex; align-items: center; gap: 6px; margin: 6px 0;
+  font-size: 12px; color: var(--fg); text-transform: none; letter-spacing: 0;
+}
+.modal .body label.inline-cb input { width: auto; }
+.modal .body .col-defs { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.modal .body .col-def {
+  display: grid; gap: 4px; align-items: center;
+  grid-template-columns: 1.1fr 1.1fr 1fr auto auto auto;
+}
+.modal .body .col-def label.inline-cb { margin: 0; font-size: 10px; gap: 3px; }
+.modal .body .col-def button.sm { margin: 0; padding: 4px; }
+.modal .body .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
 /* ----- SQL view ----- */
 .sql-wrap textarea {
   width: 100%; min-height: 160px; font-family: ui-monospace, Menlo, Consolas, monospace;

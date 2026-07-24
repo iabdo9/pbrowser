@@ -1,8 +1,23 @@
 # pbrowser
 
+> [!WARNING]
+> **Never use this tool in production.**
+>
+> pbrowser is built for local development and throwaway databases. It hands whoever
+> is logged in full read/write access to any database they can reach, runs arbitrary
+> SQL, and deletes rows in bulk. It has not been hardened or audited for
+> production use.
+>
+> If you deploy it against a production database anyway, **you do so entirely at your
+> own risk and take full responsibility for the consequences** — including data loss,
+> corruption, and credential exposure. The author provides no warranty and accepts no
+> liability (see [LICENSE](LICENSE)).
+
 A minimalist, self-hosted PostgreSQL browser for the web. Login, paste a connection string, and you get a clean black-and-white UI to explore schemas, browse and edit rows, follow foreign keys, generate realistic random data, and bulk-delete with checkboxes — all without a single framework on the front end.
 
 > Built for developers who want pgAdmin-style power with the ergonomics of a static page.
+
+![Browsing rows in the table view](docs/screenshots/03-rows.png)
 
 ## Highlights
 
@@ -16,6 +31,80 @@ A minimalist, self-hosted PostgreSQL browser for the web. Login, paste a connect
 - 🗺️ **Schema map** — interactive ER-style diagram of every table, column, PK/FK tag, and relationship; drag, zoom, pan, and double-click a table to jump straight to its rows.
 - 🧪 **Raw SQL editor** — Ctrl/Cmd+Enter to run, results rendered as a table.
 - 🖤 **Minimalist UI** — vanilla JS, vanilla CSS, no build step.
+
+## Screenshots
+
+All screenshots below were taken against a throwaway demo database seeded with
+synthetic data — no real records appear anywhere. Passwords and connection
+strings are blurred.
+
+### Sign in
+
+Username and password come from `.env`. When `TOTP_SECRET` is set, a third field
+appears for the 6-digit code.
+
+![Sign-in screen with the password field blurred](docs/screenshots/01-login.png)
+
+### Connect
+
+Successful connections are remembered for one-click reconnect; the connection
+string itself never leaves the server, so the cards only show host/user/database.
+
+![Connect page listing recent connections above a connection-string field](docs/screenshots/02-connect.png)
+
+### Browse and edit rows
+
+Paginated rows with sortable headers and free-text filtering. Foreign-key cells
+are clickable, and every row gets **Related**, **Edit** and **Delete** actions.
+
+![Row list for public.orders](docs/screenshots/03-rows.png)
+
+The editor is type-aware: enums render as `<select>`s, foreign keys as pickers,
+nullable columns get a NULL toggle, and defaults are shown inline.
+
+![Edit-row dialog for a single order](docs/screenshots/04-row-editor.png)
+
+### Follow foreign keys
+
+**Related** pulls every incoming reference to the current row, grouped by the
+table and column that points at it.
+
+![Related-rows dialog showing addresses, orders and reviews for one customer](docs/screenshots/05-related.png)
+
+### Generate random rows
+
+Each column gets an auto-detected generator you can override. FK columns are
+pre-loaded with valid targets, enums with valid labels, and unique constraints
+are listed so colliding rows can be skipped.
+
+![Generate-rows dialog for public.products](docs/screenshots/06-generate.png)
+
+### Bulk delete
+
+Selection persists across pages; the header checkbox supports an indeterminate
+state, and the delete runs as a transactional batch.
+
+![Row list with five rows checked and a "Delete 5 selected" button](docs/screenshots/07-bulk-delete.png)
+
+### SQL
+
+Arbitrary statements against the active connection, Ctrl/Cmd+Enter to run,
+results as a table.
+
+![SQL view running a grouped aggregate query](docs/screenshots/08-sql.png)
+
+### Schema map
+
+The whole schema as an interactive diagram — PK/FK tags, bezier FK arrows,
+draggable nodes, zoom and pan.
+
+![Schema map with seven tables and their foreign-key relationships](docs/screenshots/09-map.png)
+
+### Structure
+
+Columns, indexes and constraints for the selected table, with inline DDL actions.
+
+![Structure view for public.products](docs/screenshots/10-structure.png)
 
 ## Quick start
 
@@ -161,10 +250,13 @@ Internal HTTP endpoints (session-authenticated, JSON):
 
 ## Security notes
 
-- Treat pbrowser as a privileged tool — anyone with login credentials can read and modify any database whose connection string they can supply.
+**Not for production.** See the warning at the top of this file — running pbrowser
+against a production database is unsupported and entirely at your own risk.
+
+- Treat pbrowser as a privileged tool — anyone with login credentials can read and modify any database whose connection string they can supply, and can run arbitrary SQL through the SQL view.
 - Run it behind HTTPS and a reverse proxy. The server binds to all interfaces by default.
 - Use a strong `SESSION_SECRET`, enable `TOTP_SECRET`, and restrict network access (firewall, VPN, or proxy `bind`).
-- Connection strings are kept in server memory for the lifetime of the session and are never persisted to disk.
+- **Saved connections are stored in plaintext.** Connection strings you save land in `connections.json` next to the server (override with `CONNECTIONS_FILE`), written `0600` and gitignored. They include database passwords. Delete the file — or skip saving connections — if that is not acceptable. Ad-hoc connections that you don't save are held only in server memory for the lifetime of the session.
 
 ## Tech stack
 
