@@ -70,7 +70,11 @@ async function api(path, opts = {}) {
   });
   if (r.status === 401) { location.href = '/'; throw new Error('unauthorized'); }
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (!r.ok) {
+    const err = new Error(j.error || r.statusText);
+    err.detail = j.detail; err.body = j;
+    throw err;
+  }
   return j;
 }
 
@@ -421,6 +425,10 @@ function renderTable(root) {
     onclick: () => openBulkGenerator(),
     title: 'Insert many rows with random data',
   }, '⚡ Generate rows'));
+  toolbar.appendChild(el('button', {
+    onclick: () => openExportRows(),
+    title: 'Export selection, page, or all rows as CSV / JSON',
+  }, '⭳ Export'));
   toolbar.appendChild(el('button', { onclick: refresh }, 'Refresh'));
 
   // Bulk-delete button: only meaningful when we have a PK and a selection
@@ -976,15 +984,20 @@ function fieldRow(labelText, inputEl, hint) {
   return f;
 }
 
-// A type <input> backed by a datalist: suggestions, but any valid type may be typed.
+// A type <select> of the common Postgres types. When editing a column whose
+// current type isn't in the list (enums, `timestamp with time zone`, …), that
+// type is prepended and pre-selected so it's preserved and Save doesn't trigger
+// an accidental re-cast.
 function typeInput(value = '') {
-  const id = 'types-' + Math.random().toString(36).slice(2, 9);
-  const input = el('input', { type: 'text', list: id, spellcheck: 'false', placeholder: 'text' });
-  input.value = value;
-  const dl = el('datalist', { id });
-  for (const t of COMMON_TYPES) dl.appendChild(el('option', { value: t }));
+  const input = el('select', { spellcheck: 'false' });
+  const types = value && !COMMON_TYPES.includes(value) ? [value, ...COMMON_TYPES] : COMMON_TYPES;
+  for (const t of types) {
+    const o = el('option', { value: t }, t);
+    if (t === value) o.selected = true;
+    input.appendChild(o);
+  }
   const box = el('div', {});
-  box.appendChild(input); box.appendChild(dl);
+  box.appendChild(input);
   return { box, input };
 }
 
@@ -1669,6 +1682,8 @@ async function fillDatabase(wrap) {
   wrap.innerHTML = '';
   const tb = el('div', { class: 'toolbar' });
   tb.appendChild(el('span', { class: 'title' }, `Database — ${state.info ? state.info.db : ''}`));
+  tb.appendChild(el('button', { onclick: () => openExportDb() }, '⭳ Export'));
+  tb.appendChild(el('button', { onclick: () => openImportDb() }, '⭱ Import'));
   tb.appendChild(el('button', { onclick: () => fillDatabase(wrap) }, 'Refresh'));
   wrap.appendChild(tb);
 
@@ -2002,6 +2017,212 @@ async function dropRole(r) {
   catch (e) { alert('Drop role failed: ' + e.message); }
 }
 
+// ---------------- Tabular export (CSV / JSON) ----------------
+// Values arrive here already JSON-parsed: timestamps are ISO strings, arrays and
+// json/jsonb are JS arrays/objects, NULL is null.
+function exportCellText(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+function toCSV(rows, cols) {
+  const esc = (s) => /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  const head = cols.map(c => esc(String(c))).join(',');
+  const body = rows.map(r => cols.map(c => esc(exportCellText(r[c]))).join(',')).join('\r\n');
+  return '﻿' + head + (body ? '\r\n' + body : ''); // BOM so Excel reads UTF-8
+}
+function toJSON(rows, cols) {
+  return JSON.stringify(rows.map(r => {
+    const o = {};
+    for (const c of cols) o[c] = r[c] === undefined ? null : r[c];
+    return o;
+  }), null, 2);
+}
+function downloadText(filename, text, mime) {
+  const blob = new Blob([text], { type: mime + ';charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url, download: filename });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function exportRows(rows, cols, format, baseName) {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  if (format === 'json') downloadText(`${baseName}-${stamp}.json`, toJSON(rows, cols), 'application/json');
+  else downloadText(`${baseName}-${stamp}.csv`, toCSV(rows, cols), 'text/csv');
+}
+
+// Data-view export: selection (across pages), current page, or all matching rows.
+function openExportRows() {
+  const cols = state.columns.map(c => c.column_name);
+  const selCount = state.selection.size;
+  const hasFilter = state.filter && Object.keys(state.filter).length > 0;
+  const hasPk = state.primaryKey.length > 0;
+
+  const format = el('select');
+  format.appendChild(el('option', { value: 'csv' }, 'CSV'));
+  format.appendChild(el('option', { value: 'json' }, 'JSON'));
+
+  const scope = el('select');
+  if (selCount > 0 && hasPk) scope.appendChild(el('option', { value: 'selected' }, `Selected rows (${selCount})`));
+  scope.appendChild(el('option', { value: 'page' }, `This page (${state.rows.length})`));
+  scope.appendChild(el('option', { value: 'all' }, `All rows${hasFilter ? ' matching filter' : ''} (${state.total})`));
+
+  const status = el('div', { class: 'hint' });
+  const body = el('div', {},
+    fieldRow('Format', format),
+    fieldRow('Rows', scope),
+    status,
+  );
+  modal({
+    title: `Export ${state.schema}.${state.table}`,
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Export', class: 'primary',
+        onClick: async (close) => {
+          const fmt = format.value;
+          try {
+            let rows;
+            if (scope.value === 'page') {
+              rows = state.rows;
+            } else {
+              status.textContent = 'Fetching rows…';
+              const body = {
+                schema: state.schema, table: state.table,
+                orderBy: state.orderBy || undefined, orderDir: state.orderDir,
+              };
+              if (scope.value === 'selected') body.pks = [...state.selection].map(k => JSON.parse(k));
+              else if (hasFilter) body.where = state.filter;
+              const r = await api('/api/export-rows', { method: 'POST', body });
+              rows = r.rows;
+              if (r.truncated) alert(`Export capped at ${rows.length} rows — the result set is larger.`);
+            }
+            exportRows(rows, cols, fmt, `${state.schema}.${state.table}`);
+            close();
+          } catch (e) { status.textContent = ''; alert('Export failed: ' + (e.detail || e.message)); }
+        },
+      },
+    ],
+  });
+}
+
+// ---------------- Full database export / import ----------------
+function fmtBytes(n) {
+  if (n == null) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
+}
+
+function openExportDb() {
+  const format = el('select');
+  for (const [v, l] of [['custom', 'Custom (compressed — restore with pg_restore)'], ['plain', 'Plain SQL (.sql — restore with psql)'], ['tar', 'Tar archive']]) {
+    format.appendChild(el('option', { value: v }, l));
+  }
+  const scope = el('select');
+  for (const [v, l] of [['all', 'Schema + data (everything)'], ['schema', 'Schema only'], ['data', 'Data only']]) {
+    scope.appendChild(el('option', { value: v }, l));
+  }
+  const portable = el('input', { type: 'checkbox' }); portable.checked = true;
+  const status = el('div', { class: 'hint' });
+
+  const body = el('div', {},
+    fieldRow('Format', format),
+    fieldRow('Contents', scope),
+    el('label', { class: 'inline-cb' }, portable, el('span', {}, 'Portable (skip ownership & grants — restores cleanly into any role)')),
+    el('p', { class: 'hint' }, `Runs pg_dump on the server for “${state.info ? state.info.db : ''}”, then downloads the result. Large databases stream straight to disk.`),
+    status,
+  );
+
+  modal({
+    title: 'Export database',
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Export', class: 'primary',
+        onClick: async (close) => {
+          status.textContent = 'Running pg_dump…';
+          try {
+            const j = await api('/api/db/export', {
+              method: 'POST',
+              body: { format: format.value, scope: scope.value === 'all' ? undefined : scope.value, portable: portable.checked },
+            });
+            status.textContent = `Ready — ${fmtBytes(j.bytes)}. Downloading…`;
+            // Anchor download streams to disk (no browser-memory blob).
+            const a = el('a', { href: `/api/db/export/download/${encodeURIComponent(j.id)}`, download: j.filename });
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(close, 800);
+          } catch (e) {
+            status.textContent = '';
+            alert('Export failed: ' + (e.detail || e.message));
+          }
+        },
+      },
+    ],
+  });
+}
+
+function openImportDb() {
+  const fileInput = el('input', { type: 'file' });
+  const clean = el('input', { type: 'checkbox' }); clean.checked = true;
+  const stop = el('input', { type: 'checkbox' }); stop.checked = true;
+  const confirmIn = el('input', { type: 'text', placeholder: 'IMPORT', spellcheck: 'false' });
+  const status = el('div', { class: 'hint' });
+  const output = el('textarea', { spellcheck: 'false', readonly: true, style: 'min-height:120px; display:none' });
+
+  const body = el('div', {},
+    el('p', { class: 'hint danger-text' }, `This restores a dump into “${state.info ? state.info.db : ''}” and can overwrite or drop existing objects. Take a backup (Export) first.`),
+    fieldRow('Dump file', fileInput, 'Custom/tar dumps use pg_restore; .sql files use psql. Format is auto-detected.'),
+    el('label', { class: 'inline-cb' }, clean, el('span', {}, 'Clean first — drop existing objects before recreating (custom/tar only)')),
+    el('label', { class: 'inline-cb' }, stop, el('span', {}, 'Stop on first error')),
+    fieldRow('Type IMPORT to confirm', confirmIn),
+    status,
+    output,
+  );
+
+  modal({
+    title: 'Import database',
+    body,
+    actions: [
+      { label: 'Cancel', onClick: (close) => close() },
+      {
+        label: 'Import', class: 'danger',
+        onClick: async (close) => {
+          const f = fileInput.files && fileInput.files[0];
+          if (!f) { alert('Choose a dump file'); return; }
+          if (confirmIn.value.trim() !== 'IMPORT') { alert('Type IMPORT to confirm'); return; }
+          status.textContent = `Uploading & restoring ${f.name} (${fmtBytes(f.size)})…`;
+          output.style.display = 'none';
+          try {
+            const qs = new URLSearchParams({ clean: clean.checked ? '1' : '0', stop: stop.checked ? '1' : '0' });
+            const r = await fetch('/api/db/import?' + qs.toString(), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: f,
+            });
+            const j = await r.json().catch(() => ({}));
+            const log = [j.stdout, j.stderr].filter(Boolean).join('\n\n');
+            if (log) { output.value = log; output.style.display = ''; }
+            if (r.ok && j.ok) {
+              status.textContent = `Done via ${j.tool} (${j.format}). Exit code 0.`;
+              await afterDbDdl({ reloadSchemas: true });
+            } else {
+              status.textContent = `Failed${j.tool ? ' via ' + j.tool : ''}${j.code != null ? ` (exit ${j.code})` : ''}.`;
+              if (!log) alert('Import failed: ' + (j.detail || j.error || r.statusText));
+            }
+          } catch (e) {
+            status.textContent = '';
+            alert('Import failed: ' + e.message);
+          }
+        },
+      },
+    ],
+  });
+}
+
 // ---------------- Map view (schema diagram) ----------------
 async function renderMap(root) {
   const wrap = el('div', { class: 'map-wrap' });
@@ -2244,6 +2465,13 @@ function renderSql(root) {
       notice.className = 'notice ok';
       notice.textContent = `${r.command || 'OK'} · ${r.rowCount ?? 0} row(s)`;
       if (r.rows && r.rows.length > 0) {
+        const cols = r.fields.map(f => f.name);
+        out.appendChild(el('div', { class: 'result-bar' },
+          el('span', { class: 'muted-note' }, `${r.rows.length} row(s)`),
+          el('span', { style: 'flex:1' }),
+          el('button', { class: 'sm', title: 'Export result as CSV', onclick: () => exportRows(r.rows, cols, 'csv', 'query') }, '⭳ CSV'),
+          el('button', { class: 'sm', title: 'Export result as JSON', onclick: () => exportRows(r.rows, cols, 'json', 'query') }, '⭳ JSON'),
+        ));
         const tbl = el('table', { class: 'data' });
         const thead = el('thead'); const hr = el('tr');
         for (const f of r.fields) hr.appendChild(el('th', {}, f.name));

@@ -3,7 +3,9 @@
 require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const express = require('express');
 const session = require('express-session');
 const { Pool } = require('pg');
@@ -205,7 +207,9 @@ app.post('/api/connect', requireAuth, async (req, res) => {
   try {
     const r = await pool.query('SELECT current_database() AS db, current_user AS usr, version() AS version');
     const info = r.rows[0];
-    pools.set(req.sessionID, { pool, info });
+    // Retain the connection string so pg_dump / pg_restore / psql can reconnect
+    // for full-database export & import (kept in memory only, per session).
+    pools.set(req.sessionID, { pool, info, connectionString });
     try { rememberConnection(connectionString, label); } catch (_) { /* non-fatal */ }
     res.json({ ok: true, info });
   } catch (e) {
@@ -632,6 +636,55 @@ app.post('/api/related', requireAuth, requireDb, async (req, res) => {
       rows: r.rows,
       fields: r.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID })),
       total, limit, offset,
+    });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---------- Bulk fetch for export ----------
+// Returns all rows for a selection (by primary keys) or for the current filter,
+// in one query, capped at EXPORT_MAX_ROWS. Formatting into CSV/JSON happens on the
+// client from the data it already renders; this only supplies rows it doesn't have
+// (selections spanning pages, or the full result set beyond the current page).
+const EXPORT_MAX_ROWS = Number(process.env.EXPORT_MAX_ROWS || 200000);
+app.post('/api/export-rows', requireAuth, requireDb, async (req, res) => {
+  const { schema = 'public', table, orderBy, orderDir, where, pks } = req.body || {};
+  if (!table) return res.status(400).json({ error: 'missing_table' });
+  const limit = Math.min(parseInt(req.body?.limit, 10) || EXPORT_MAX_ROWS, EXPORT_MAX_ROWS);
+  try {
+    const fq = `${qIdent(schema)}.${qIdent(table)}`;
+    let whereSql = '';
+    const vals = [];
+    if (Array.isArray(pks) && pks.length > 0) {
+      const keys = Object.keys(pks[0] || {});
+      if (keys.length === 0) return res.status(400).json({ error: 'empty_pk' });
+      if (keys.length === 1) {
+        // Single-column PK: one array parameter handles any number of keys.
+        whereSql = `WHERE ${qIdent(keys[0])} = ANY($1)`;
+        vals.push(pks.map(p => p[keys[0]]));
+      } else {
+        // Composite PK: OR of AND-groups. Guard against the bind-parameter limit.
+        if (pks.length * keys.length > 60000) {
+          return res.status(400).json({ error: 'selection_too_large', detail: 'Too many selected rows with a composite key; export by filter instead.' });
+        }
+        let pi = 1;
+        const groups = pks.map(p => `(${keys.map(k => `${qIdent(k)} = $${pi++}`).join(' AND ')})`);
+        for (const p of pks) for (const k of keys) vals.push(p[k]);
+        whereSql = `WHERE ${groups.join(' OR ')}`;
+      }
+    } else if (where && typeof where === 'object' && Object.keys(where).length > 0) {
+      const keys = Object.keys(where);
+      whereSql = 'WHERE ' + keys.map((k, i) => where[k] === null ? `${qIdent(k)} IS NULL` : `${qIdent(k)} = $${i + 1}`).join(' AND ');
+      for (const k of keys) if (where[k] !== null) vals.push(where[k]);
+    }
+    let sql = `SELECT * FROM ${fq} ${whereSql}`;
+    if (orderBy) sql += ` ORDER BY ${qIdent(orderBy)} ${String(orderDir).toUpperCase() === 'DESC' ? 'DESC' : 'ASC'}`;
+    sql += ` LIMIT ${limit + 1}`; // +1 row to detect truncation
+    const r = await getPool(req).query(sql, vals);
+    const truncated = r.rows.length > limit;
+    res.json({
+      rows: truncated ? r.rows.slice(0, limit) : r.rows,
+      fields: r.fields.map(f => ({ name: f.name })),
+      truncated,
     });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -1488,6 +1541,178 @@ app.post('/api/ddl/role/drop', requireAuth, requireDb, async (req, res) => {
     await getPool(req).query(sql);
     res.json({ ok: true, sql });
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ---------- Full database export / import (pg_dump / pg_restore / psql) ----------
+// These shell out to the libpq CLI tools with an args ARRAY (never a shell string),
+// so nothing here is injectable. The DB password travels via the PGPASSWORD env var
+// (not visible in `ps`); all other flags come from fixed whitelists and
+// server-generated temp paths. No privilege beyond the user's existing SQL access.
+
+function getConnString(req) {
+  return pools.get(req.sessionID)?.connectionString || null;
+}
+
+// Connection-string query parameters libpq understands. ORMs append extras the
+// node `pg` driver quietly ignores (Prisma's ?schema=, ?pgbouncer=,
+// ?connection_limit=, ...), but pg_dump/psql/pg_restore reject the whole URI with
+// "invalid URI query parameter", so anything outside this set is stripped.
+const LIBPQ_PARAMS = new Set([
+  'host', 'hostaddr', 'port', 'dbname', 'user', 'password', 'passfile', 'require_auth',
+  'channel_binding', 'connect_timeout', 'client_encoding', 'options', 'application_name',
+  'fallback_application_name', 'keepalives', 'keepalives_idle', 'keepalives_interval',
+  'keepalives_count', 'tcp_user_timeout', 'replication', 'gssencmode', 'sslmode',
+  'requiressl', 'sslnegotiation', 'sslcompression', 'sslcert', 'sslkey', 'sslpassword',
+  'sslcertmode', 'sslrootcert', 'sslcrl', 'sslcrldir', 'sslsni', 'requirepeer',
+  'ssl_min_protocol_version', 'ssl_max_protocol_version', 'krbsrvname', 'gsslib',
+  'gssdelegation', 'service', 'target_session_attrs', 'load_balance_hosts',
+]);
+
+// Turn a connection string into { arg, env } for libpq tools. The password is
+// stripped out of the URI and moved to PGPASSWORD so it never lands on argv, and
+// non-libpq query parameters are dropped so the CLI tools accept the URI.
+function pgToolConn(cs) {
+  const env = { ...process.env };
+  try {
+    const u = new URL(cs);
+    if (u.password) { env.PGPASSWORD = decodeURIComponent(u.password); u.password = ''; }
+    for (const key of [...u.searchParams.keys()]) {
+      if (!LIBPQ_PARAMS.has(key)) u.searchParams.delete(key);
+    }
+    return { arg: u.toString(), env };
+  } catch (_) {
+    return { arg: cs, env }; // libpq key=value DSN — pass through unchanged
+  }
+}
+
+function tmpFile(prefix) {
+  return path.join(os.tmpdir(), `${prefix}-${crypto.randomBytes(9).toString('hex')}`);
+}
+
+function safeUnlink(p) { if (p) fs.unlink(p, () => { }); }
+
+// Cap collected stderr/stdout so a chatty tool cannot exhaust memory.
+function tailCollector(limit = 200_000) {
+  let s = '';
+  return {
+    push(buf) { s += buf.toString(); if (s.length > limit) s = s.slice(-limit); },
+    get text() { return s.trim(); },
+  };
+}
+
+// Prepared dumps waiting to be downloaded: id -> { sid, path, filename, timer }.
+const pendingDumps = new Map();
+const DUMP_TTL_MS = 10 * 60 * 1000;
+
+const EXPORT_FORMAT = { custom: '-Fc', plain: '-Fp', tar: '-Ft' };
+const EXPORT_EXT = { custom: 'dump', plain: 'sql', tar: 'tar' };
+
+// Step 1: run pg_dump into a temp file. Returns an id to download (or a JSON error).
+app.post('/api/db/export', requireAuth, requireDb, (req, res) => {
+  const cs = getConnString(req);
+  if (!cs) return res.status(409).json({ error: 'no_connection_string', detail: 'Reconnect to enable export.' });
+  const { format = 'custom', scope, portable = true } = req.body || {};
+  if (!EXPORT_FORMAT[format]) return res.status(400).json({ error: 'invalid_format' });
+
+  const { arg, env } = pgToolConn(cs);
+  const out = tmpFile('pbdump');
+  const args = ['-d', arg, EXPORT_FORMAT[format], '-f', out];
+  if (portable) args.push('--no-owner', '--no-privileges');
+  if (scope === 'schema') args.push('--schema-only');
+  else if (scope === 'data') args.push('--data-only');
+
+  const child = spawn('pg_dump', args, { env });
+  const errc = tailCollector();
+  child.stderr.on('data', d => errc.push(d));
+  child.on('error', (e) => { safeUnlink(out); if (!res.headersSent) res.status(500).json({ error: 'pg_dump_unavailable', detail: e.message }); });
+  child.on('close', (code) => {
+    if (code !== 0) { safeUnlink(out); return res.status(400).json({ error: 'pg_dump_failed', detail: errc.text || `exit ${code}` }); }
+    let bytes = 0;
+    try { bytes = fs.statSync(out).size; } catch (_) { }
+    const db = pools.get(req.sessionID)?.info?.db || 'database';
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const filename = `${db}-${stamp}.${EXPORT_EXT[format]}`;
+    const id = crypto.randomBytes(12).toString('hex');
+    const timer = setTimeout(() => { pendingDumps.delete(id); safeUnlink(out); }, DUMP_TTL_MS);
+    pendingDumps.set(id, { sid: req.sessionID, path: out, filename, timer });
+    res.json({ ok: true, id, filename, bytes });
+  });
+});
+
+// Step 2: stream the prepared dump as a download, then delete it.
+app.get('/api/db/export/download/:id', requireAuth, (req, res) => {
+  const entry = pendingDumps.get(req.params.id);
+  if (!entry || entry.sid !== req.sessionID) return res.status(404).json({ error: 'not_found' });
+  clearTimeout(entry.timer);
+  pendingDumps.delete(req.params.id);
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename="${entry.filename}"`);
+  const stream = fs.createReadStream(entry.path);
+  stream.on('error', () => { safeUnlink(entry.path); if (!res.headersSent) res.status(500).end(); });
+  stream.on('close', () => safeUnlink(entry.path));
+  stream.pipe(res);
+});
+
+// Import: the raw request body IS the dump file (sent as octet-stream, so the JSON
+// body parser skips it and we stream straight to disk — no size ceiling from the
+// 32mb JSON limit). Options ride on the query string.
+const IMPORT_MAX_BYTES = Number(process.env.IMPORT_MAX_BYTES || 4 * 1024 * 1024 * 1024);
+app.post('/api/db/import', requireAuth, requireDb, (req, res) => {
+  const cs = getConnString(req);
+  if (!cs) return res.status(409).json({ error: 'no_connection_string', detail: 'Reconnect to enable import.' });
+  const clean = req.query.clean === '1';
+  const stopOnError = req.query.stop === '1';
+
+  const file = tmpFile('pbimport');
+  const ws = fs.createWriteStream(file);
+  let size = 0, aborted = false;
+  req.on('data', (d) => {
+    size += d.length;
+    if (size > IMPORT_MAX_BYTES && !aborted) {
+      aborted = true; req.destroy(); ws.destroy(); safeUnlink(file);
+      if (!res.headersSent) res.status(413).json({ error: 'file_too_large' });
+    }
+  });
+  ws.on('error', () => { if (!aborted && !res.headersSent) { safeUnlink(file); res.status(500).json({ error: 'write_failed' }); } });
+  req.on('error', () => { if (!aborted) { safeUnlink(file); ws.destroy(); } });
+  ws.on('finish', () => {
+    if (aborted) return;
+    // Detect custom/tar dumps by their leading "PGDMP" magic; else treat as plain SQL.
+    let magic = '';
+    try {
+      const fd = fs.openSync(file, 'r');
+      const b = Buffer.alloc(5);
+      const n = fs.readSync(fd, b, 0, 5, 0);
+      fs.closeSync(fd);
+      magic = b.slice(0, n).toString('latin1');
+    } catch (_) { }
+    const isArchive = magic === 'PGDMP';
+    const { arg, env } = pgToolConn(cs);
+
+    let cmd, args;
+    if (isArchive) {
+      cmd = 'pg_restore';
+      args = ['-d', arg, '--no-owner', '--no-privileges'];
+      if (clean) args.push('--clean', '--if-exists');
+      if (stopOnError) args.push('--exit-on-error');
+      args.push(file);
+    } else {
+      cmd = 'psql';
+      args = ['-d', arg, '-v', `ON_ERROR_STOP=${stopOnError ? 1 : 0}`, '-f', file];
+    }
+
+    const child = spawn(cmd, args, { env });
+    const outc = tailCollector(), errc = tailCollector();
+    child.stdout.on('data', d => outc.push(d));
+    child.stderr.on('data', d => errc.push(d));
+    child.on('error', (e) => { safeUnlink(file); if (!res.headersSent) res.status(500).json({ error: 'tool_unavailable', detail: e.message }); });
+    child.on('close', (code) => {
+      safeUnlink(file);
+      if (res.headersSent) return;
+      res.json({ ok: code === 0, format: isArchive ? 'custom/tar' : 'plain', tool: cmd, code, stdout: outc.text, stderr: errc.text });
+    });
+  });
+  req.pipe(ws);
 });
 
 // ---------- Static / pages ----------

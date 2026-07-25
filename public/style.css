@@ -222,6 +222,8 @@ button.ghost:hover:not(:disabled) { opacity: 1; }
   max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .muted-note { font-size: 11px; color: var(--muted); }
+.modal .body .hint.danger-text { color: var(--danger); }
+.result-bar { display: flex; align-items: center; gap: 6px; margin: 8px 0 6px; }
 .struct-sec .hint { font-size: 11px; color: var(--muted); margin: 0 0 8px; }
 
 /* drag-to-reorder columns */
