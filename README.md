@@ -13,7 +13,7 @@
 > corruption, and credential exposure. The author provides no warranty and accepts no
 > liability (see [LICENSE](LICENSE)).
 
-A minimalist, self-hosted PostgreSQL browser for the web. Login, paste a connection string, and you get a clean black-and-white UI to explore schemas, browse and edit rows, follow foreign keys, generate realistic random data, and bulk-delete with checkboxes — all without a single framework on the front end.
+A minimalist, self-hosted PostgreSQL browser and lightweight admin tool for the web. Login, paste a connection string, and you get a clean black-and-white UI to explore schemas, browse and edit rows, follow foreign keys, generate realistic random data, bulk-delete with checkboxes, edit the schema itself (tables, columns, indexes, constraints, views, functions, roles), export rows as CSV/JSON, and back up or restore the whole database — all without a single framework on the front end.
 
 > Built for developers who want pgAdmin-style power with the ergonomics of a static page.
 
@@ -23,11 +23,16 @@ A minimalist, self-hosted PostgreSQL browser for the web. Login, paste a connect
 
 - 🔐 **Authentication built in** — username/password from `.env`, optional TOTP (RFC 6238) second factor.
 - 🔌 **Per-session connection** — users paste any Postgres URL after login; each session gets its own isolated pool.
+- 💾 **Saved connections** — successful connections are remembered for one-click reconnect; the secret stays server-side, so only host/user/database metadata ever reaches the browser.
 - 🗂️ **Schema browser** — schemas → tables → rows with pagination, sorting, and free-text filtering.
 - ✏️ **Full CRUD** with type-aware inputs: enum columns become `<select>`s, booleans become toggles, foreign keys become searchable pickers.
 - 🔗 **Foreign-key navigation** — outgoing FKs render as clickable links; every row exposes a "Related" view that pulls in incoming references.
 - ⚡ **Bulk random row generator** — ~80 generators across 11 categories (names, addresses, dates, ids, lorem, etc.) with FK-valid picks, enum seeding, unique-constraint deduping, and exact-count retry.
 - ☑️ **Bulk delete with checkboxes** — select rows across pages, transactional batched delete, supports composite primary keys.
+- 🛠️ **Schema editing (DDL)** — create / rename / truncate / drop tables, add / alter / drop columns, reorder columns, and manage indexes and constraints from the **Structure** view — no hand-written SQL required.
+- 🗄️ **Database objects** — browse and manage schemas, views & materialized views, functions / procedures, and roles from the **Database** view.
+- ⭳ **Row export** — export the current selection, page, or the entire (optionally filtered) result set as CSV or JSON.
+- 📦 **Backup & restore** — dump the whole database with `pg_dump` (custom / plain / tar) and restore a dump with `pg_restore` / `psql`, straight from the browser.
 - 🗺️ **Schema map** — interactive ER-style diagram of every table, column, PK/FK tag, and relationship; drag, zoom, pan, and double-click a table to jump straight to its rows.
 - 🧪 **Raw SQL editor** — Ctrl/Cmd+Enter to run, results rendered as a table.
 - 🖤 **Minimalist UI** — vanilla JS, vanilla CSS, no build step.
@@ -133,14 +138,17 @@ npm run dev    # node --watch server.js
 
 All configuration is read from `.env` at startup.
 
-| Variable          | Required | Default | Purpose                                                              |
-| ----------------- | :------: | :-----: | -------------------------------------------------------------------- |
-| `AUTH_USER`       | ✅       | —       | Login username                                                       |
-| `AUTH_PASS`       | ✅       | —       | Login password                                                       |
-| `SESSION_SECRET`  | ✅¹      | random  | Cookie session signing secret                                        |
-| `TOTP_SECRET`     |          | —       | Base32 TOTP secret. When set, a 6-digit code is required on login.   |
-| `PORT`            |          | `3000`  | HTTP listen port                                                     |
-| `DEFAULT_PG_URL`  |          | —       | Pre-fills the connection-string input on the connect page            |
+| Variable           | Required | Default              | Purpose                                                                                   |
+| ------------------ | :------: | :------------------: | ----------------------------------------------------------------------------------------- |
+| `AUTH_USER`        | ✅       | —                    | Login username                                                                            |
+| `AUTH_PASS`        | ✅       | —                    | Login password                                                                            |
+| `SESSION_SECRET`   | ✅¹      | random               | Cookie session signing secret                                                            |
+| `TOTP_SECRET`      |          | —                    | Base32 TOTP secret. When set, a 6-digit code is required on login.                       |
+| `PORT`             |          | `3000`               | HTTP listen port                                                                         |
+| `DEFAULT_PG_URL`   |          | —                    | Pre-fills the connection-string input on the connect page                               |
+| `CONNECTIONS_FILE` |          | `./connections.json` | Where saved connections are persisted. Holds DB passwords in plaintext, written `0600`. |
+| `EXPORT_MAX_ROWS`  |          | `200000`             | Row-export cap; larger result sets are truncated (the UI warns).                        |
+| `IMPORT_MAX_BYTES` |          | `4 GiB`              | Maximum size of an uploaded dump on the database **Import**.                             |
 
 ¹ A random secret is generated at startup if you omit `SESSION_SECRET`, but every restart will invalidate active sessions.
 
@@ -164,7 +172,7 @@ When `TOTP_SECRET` is set, the login form shows a 6-digit code field.
 
 - Click any table in the sidebar to load rows.
 - Click a column header to sort; the filter box does a server-side `ILIKE` across text columns.
-- Use **+ Row** to insert; the editor knows about enums, booleans, foreign keys, defaults, and nullability.
+- Use **+ Insert row** to insert; the editor knows about enums, booleans, foreign keys, defaults, and nullability.
 - Tables without a primary key are read-only in the row editor — use the SQL view to modify them.
 
 ### Foreign-key navigation
@@ -204,15 +212,51 @@ The **Map** view in the sidebar renders the entire current schema as an interact
 - Double-click a node title to jump to that table's rows in the Tables view.
 - Powered by a single `/api/schema-map` query — no build step, no diagramming library, just SVG + DOM.
 
+### Structure (schema editing)
+
+The **Structure** view manages the selected table without hand-written DDL:
+
+- **Table:** create, rename, truncate, or drop.
+- **Columns:** add, edit (name, type, default, `NOT NULL`), or drop. The type field is a dropdown of common Postgres types.
+- **Reorder columns:** drag rows (or use ↑ / ↓) for a browser-local display order; **Apply order to DB** physically rewrites the table so the order is permanent.
+- **Indexes & constraints:** list them with their definitions, create indexes (unique, method `btree`/`hash`/`gist`/…), add or drop constraints.
+
+### Database objects
+
+The **Database** view manages objects beyond a single table for the connected database:
+
+- **Schemas** — create, rename, drop.
+- **Views & materialized views** — view the source, refresh a materialized view, create, or drop.
+- **Functions & procedures** — inspect the source, create, or drop.
+- **Roles** — list attributes (SUPERUSER, CREATEDB, LOGIN, …) and connection limits; create, edit, or drop.
+
+### Export rows
+
+Click **⭳ Export** on any table to save rows as **CSV** or **JSON**:
+
+- **This page** exports what's currently loaded, with no extra query.
+- **Selected rows** exports the current cross-page checkbox selection (requires a primary key).
+- **All rows** exports the entire result set, honoring the active filter and sort — capped at `EXPORT_MAX_ROWS` (the UI warns if truncated).
+
+### Backup & restore
+
+The **Database** view's **⭳ Export** / **⭱ Import** buttons run PostgreSQL's client tools on the server:
+
+- **Export** shells out to `pg_dump` — pick the format (custom / plain SQL / tar) and contents (schema + data / schema only / data only). "Portable" adds `--no-owner --no-privileges` so the dump restores cleanly into any role. The dump is prepared on the server, then streamed to your browser as a download.
+- **Import** auto-detects the dump format and restores it with `pg_restore` (custom / tar) or `psql` (`.sql`). Options: **Clean first** (drop existing objects before recreating) and **Stop on first error**. It's guarded by a type-**IMPORT**-to-confirm box, and the tool's stdout/stderr is shown when it finishes.
+
+> These two features require the `pg_dump`, `pg_restore`, and `psql` binaries to be present on the server host and to match the target server's major version. See [Tech stack](#tech-stack).
+
 ## Architecture
 
 ```
 ┌──────────────────────────┐        ┌───────────────────────────┐
 │  Browser (vanilla JS)    │  HTTP  │  Express server           │
-│  public/index.html       │ ─────▶ │  server.js                │
-│  public/app.js           │        │  ├─ session (cookie)      │
-│  public/generators.js    │ ◀───── │  ├─ per-session pg.Pool   │
-│  public/style.css        │        │  └─ pg (node-postgres)    │
+│  public/login.html       │ ─────▶ │  server.js                │
+│  public/app.html         │        │  ├─ session (cookie)      │
+│  public/app.js           │        │  ├─ per-session pg.Pool   │
+│  public/generators.js    │ ◀───── │  ├─ pg (node-postgres)    │
+│  public/style.css        │        │  └─ pg_dump / pg_restore  │
 └──────────────────────────┘        └─────────────┬─────────────┘
                                                   │ TCP
                                                   ▼
@@ -225,22 +269,39 @@ The **Map** view in the sidebar renders the entire current schema as an interact
 
 ## API
 
-Internal HTTP endpoints (session-authenticated, JSON):
+Internal HTTP endpoints (all session-authenticated, JSON unless noted).
+
+**Auth & session**
+
+| Method | Path                     | Purpose                                          |
+| ------ | ------------------------ | ------------------------------------------------ |
+| POST   | `/api/login`             | Username/password (+ TOTP) login                 |
+| POST   | `/api/logout`            | Destroy session and pool                         |
+| GET    | `/api/me`                | Current session info                             |
+| POST   | `/api/connect`           | Open a pool — by raw connection string or saved id |
+| POST   | `/api/disconnect`        | Close the pool                                   |
+| GET    | `/api/connections`       | List saved connections (metadata only, no secret) |
+| PATCH  | `/api/connections/:id`   | Rename a saved connection                        |
+| DELETE | `/api/connections/:id`   | Remove a saved connection                        |
+
+**Browsing & data**
 
 | Method | Path                  | Purpose                                              |
 | ------ | --------------------- | ---------------------------------------------------- |
-| POST   | `/api/login`          | Username/password (+ TOTP) login                     |
-| POST   | `/api/logout`         | Destroy session and pool                             |
-| GET    | `/api/me`             | Current session info                                 |
-| POST   | `/api/connect`        | Open a Postgres pool for this session                |
-| POST   | `/api/disconnect`     | Close the pool                                       |
 | GET    | `/api/schemas`        | List schemas and tables                              |
+| GET    | `/api/tables`         | Tables in a schema                                   |
 | GET    | `/api/columns`        | Columns, PK, FKs, unique constraints/indexes, enums  |
 | GET    | `/api/schema-map`     | All tables, columns, and FK edges in a schema        |
 | GET    | `/api/rows`           | Paginated rows with sort/filter                      |
-| GET    | `/api/related`        | Incoming references for a row                        |
+| POST   | `/api/related`        | Incoming references for a row                        |
 | GET    | `/api/fk-values`      | Foreign-key value picker                             |
-| GET    | `/api/unique-tuples`  | Existing tuples for unique-constraint deduping       |
+| POST   | `/api/unique-tuples`  | Existing tuples for unique-constraint deduping       |
+| POST   | `/api/export-rows`    | Fetch rows (selection / filter) for CSV/JSON export  |
+
+**Row mutations**
+
+| Method | Path                  | Purpose                                              |
+| ------ | --------------------- | ---------------------------------------------------- |
 | POST   | `/api/insert`         | Insert a single row                                  |
 | POST   | `/api/insert-bulk`    | Transactional batched insert                         |
 | POST   | `/api/update`         | Update by PK                                         |
@@ -248,12 +309,44 @@ Internal HTTP endpoints (session-authenticated, JSON):
 | POST   | `/api/delete-bulk`    | Transactional batched delete by PK list              |
 | POST   | `/api/query`          | Run arbitrary SQL                                    |
 
+**Structure (table DDL)**
+
+| Method | Path                                                    | Purpose                                  |
+| ------ | ------------------------------------------------------- | ---------------------------------------- |
+| GET    | `/api/indexes`, `/api/constraints`                      | Indexes / constraints for a table        |
+| POST   | `/api/ddl/table/{create,rename,drop,truncate,rebuild}`  | Table-level DDL                          |
+| POST   | `/api/ddl/column/{add,alter,drop}`                      | Column DDL                              |
+| POST   | `/api/ddl/index/{create,drop}`                          | Index DDL                              |
+| POST   | `/api/ddl/constraint/{add,drop}`                        | Constraint DDL                          |
+
+**Database objects**
+
+| Method | Path                                        | Purpose                                    |
+| ------ | ------------------------------------------- | ------------------------------------------ |
+| GET    | `/api/db/schemas`                           | Schemas with owners                        |
+| POST   | `/api/ddl/schema/{create,rename,drop}`      | Schema DDL                                 |
+| GET    | `/api/db/views`                             | Views & materialized views                 |
+| POST   | `/api/ddl/view/{create,drop,refresh}`       | View DDL                                   |
+| GET    | `/api/db/functions`, `/api/db/function-def` | Functions/procedures + source              |
+| POST   | `/api/ddl/function/{create,drop}`           | Function DDL                               |
+| GET    | `/api/db/roles`                             | Roles and their attributes                 |
+| POST   | `/api/ddl/role/{create,alter,drop}`         | Role DDL                                   |
+
+**Backup & restore**
+
+| Method | Path                             | Purpose                                        |
+| ------ | -------------------------------- | ---------------------------------------------- |
+| POST   | `/api/db/export`                 | Run `pg_dump`, prepare a download              |
+| GET    | `/api/db/export/download/:id`    | Stream the prepared dump, then delete it       |
+| POST   | `/api/db/import`                 | Restore an uploaded dump (`pg_restore` / `psql`) |
+
 ## Security notes
 
 **Not for production.** See the warning at the top of this file — running pbrowser
 against a production database is unsupported and entirely at your own risk.
 
-- Treat pbrowser as a privileged tool — anyone with login credentials can read and modify any database whose connection string they can supply, and can run arbitrary SQL through the SQL view.
+- Treat pbrowser as a privileged tool — anyone with login credentials can read and modify any database whose connection string they can supply, run arbitrary SQL, alter the schema, manage roles, and **back up or restore the entire database**. There is a single shared login; it is effectively a superuser console for whatever the connection can reach.
+- **Backup/restore spawns server-side processes.** Export and import shell out to `pg_dump`, `pg_restore`, and `psql` on the server host, and dumps are briefly written to a temp file before download. Anyone who can log in can trigger these.
 - Run it behind HTTPS and a reverse proxy. The server binds to all interfaces by default.
 - Use a strong `SESSION_SECRET`, enable `TOTP_SECRET`, and restrict network access (firewall, VPN, or proxy `bind`).
 - **Saved connections are stored in plaintext.** Connection strings you save land in `connections.json` next to the server (override with `CONNECTIONS_FILE`), written `0600` and gitignored. They include database passwords. Delete the file — or skip saving connections — if that is not acceptable. Ad-hoc connections that you don't save are held only in server memory for the lifetime of the session.
@@ -263,12 +356,14 @@ against a production database is unsupported and entirely at your own risk.
 - **Server:** Node.js 18+, Express 4, `pg` 8, `express-session`, `otpauth`, `dotenv`.
 - **Client:** Vanilla JS, no framework, no bundler.
 - **Database:** Tested against PostgreSQL 13+.
+- **Optional CLI tools:** the **Backup & restore** features shell out to `pg_dump`, `pg_restore`, and `psql`. They must be installed on the server host (e.g. Debian/Ubuntu `postgresql-client`) and their major version should match the target server. Everything else works without them.
 
 ## Roadmap
 
-- [ ] Export selection / query results as CSV / JSON.
+- [x] Export selection / query results as CSV / JSON.
+- [x] Per-connection bookmarks (saved connections).
+- [x] Full backup & restore (`pg_dump` / `pg_restore`).
 - [ ] Saved queries.
-- [ ] Per-connection bookmarks.
 - [ ] Dark mode.
 
 PRs welcome — see [Contributing](#contributing).
